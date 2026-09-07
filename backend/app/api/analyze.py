@@ -5,14 +5,25 @@ from pydantic import BaseModel
 
 from backend.app.agent.router import classify_query
 from backend.app.agent.trace import create_trace
+
 from backend.app.models.change_detection import (
     run_change_detection,
 )
+
 from backend.app.models.grounding import (
     run_grounding,
 )
+
 from backend.app.models.vqa import (
     run_vqa,
+)
+
+from backend.app.models.optical_sar import (
+    run_optical_sar,
+)
+
+from backend.app.models.retrieval_bridge import (
+    run_semantic_retrieval,
 )
 
 
@@ -22,28 +33,28 @@ router = APIRouter(
 )
 
 
+# ============================================================
+# REQUEST MODEL
+# ============================================================
+
 class AnalyzeRequest(BaseModel):
     query: str
     images: list[str]
 
 
-def extract_grounding_target(query: str) -> str:
-    """
-    Convert a natural-language grounding request into
-    a short target phrase for Grounding DINO.
+# ============================================================
+# GROUNDING TARGET EXTRACTION
+# ============================================================
 
-    Examples:
-        "Where are the buildings?"
-            -> "buildings"
+def extract_grounding_target(
+    query: str,
+) -> str:
 
-        "Highlight the water body."
-            -> "water body"
-
-        "Find the roads."
-            -> "roads"
-    """
-
-    target = query.lower().strip()
+    target = (
+        query
+        .lower()
+        .strip()
+    )
 
     prefixes = [
         "where are the ",
@@ -63,13 +74,19 @@ def extract_grounding_target(query: str) -> str:
     ]
 
     for prefix in prefixes:
+
         if target.startswith(prefix):
-            target = target[len(prefix):]
+
+            target = target[
+                len(prefix):
+            ]
+
             break
 
-    target = target.strip(" ?.!,")
+    target = target.strip(
+        " ?!.,"
+    )
 
-    # Remove common trailing phrases.
     trailing_phrases = [
         " in this image",
         " in the image",
@@ -78,74 +95,134 @@ def extract_grounding_target(query: str) -> str:
     ]
 
     for phrase in trailing_phrases:
-        if target.endswith(phrase):
-            target = target[: -len(phrase)].strip()
+
+        if target.endswith(
+            phrase
+        ):
+
+            target = target[
+                :-len(phrase)
+            ].strip()
 
     if not target:
+
         target = "object"
 
     return target
 
+
+# ============================================================
+# MAIN ANALYSIS ENDPOINT
+# ============================================================
 
 @router.post("/analyze")
 def analyze(
     request: AnalyzeRequest,
 ) -> dict[str, Any]:
 
-    # =========================================================
+    # ========================================================
     # 1. BASIC VALIDATION
-    # =========================================================
+    # ========================================================
 
-    query = request.query.strip()
+    query = (
+        request.query
+        .strip()
+    )
 
     if not query:
+
         raise HTTPException(
             status_code=400,
             detail="Query cannot be empty.",
         )
 
-    if not request.images:
-        raise HTTPException(
-            status_code=400,
-            detail="At least one image is required.",
+    # ========================================================
+    # 2. PLANNER
+    # ========================================================
+
+    try:
+
+        plan = classify_query(
+            query=query,
+            image_count=len(
+                request.images
+            ),
         )
 
-    # =========================================================
-    # 2. SATQUERY PLANNER
-    # =========================================================
+    except Exception as exc:
 
-    plan = classify_query(
-        query=query,
-        image_count=len(request.images),
+        raise HTTPException(
+            status_code=500,
+            detail=(
+                "Query planning failed: "
+                f"{exc}"
+            ),
+        ) from exc
+
+    task = plan.get(
+        "task",
+        "UNKNOWN",
     )
 
-    task = plan["task"]
-    tool = plan["tool"]
-
-    # =========================================================
-    # 3. EXECUTION TRACE
-    # =========================================================
-
-    trace = create_trace(plan)
-
-    # =========================================================
-    # 4. INPUT COUNT VALIDATION
-    # =========================================================
-
-    required_images = plan.get(
-        "required_images",
-        1,
+    tool = plan.get(
+        "tool",
+        "unknown",
     )
 
-    if len(request.images) < required_images:
+    # ========================================================
+    # 3. IMAGE VALIDATION
+    #
+    # Semantic Retrieval intentionally accepts zero uploaded
+    # images because the query searches the imagery index.
+    # ========================================================
+
+    required_images = int(
+        plan.get(
+            "required_images",
+            1,
+        )
+    )
+
+    if (
+        tool != "semantic_retrieval"
+        and not request.images
+    ):
+
+        raise HTTPException(
+            status_code=400,
+            detail=(
+                "At least one image is required "
+                "for this workflow."
+            ),
+        )
+
+    if len(
+        request.images
+    ) < required_images:
+
         raise HTTPException(
             status_code=400,
             detail=(
                 f"The selected task requires "
-                f"{required_images} image(s), but "
-                f"{len(request.images)} were provided."
+                f"{required_images} image(s), "
+                f"but {len(request.images)} "
+                f"were provided."
             ),
         )
+
+    # ========================================================
+    # 4. EXECUTION TRACE
+    # ========================================================
+
+    try:
+
+        trace = create_trace(
+            plan
+        )
+
+    except Exception:
+
+        trace = []
 
     trace.append(
         {
@@ -158,13 +235,391 @@ def analyze(
         }
     )
 
-    # =========================================================
-    # 5. MULTITEMPORAL CHANGE DETECTION
-    # =========================================================
+    # ========================================================
+    # 5. SEMANTIC RETRIEVAL
+    # ========================================================
+
+    if tool == "semantic_retrieval":
+
+        try:
+
+            result = run_semantic_retrieval(
+                query=query,
+                top_k=5,
+            )
+
+        except FileNotFoundError as exc:
+
+            raise HTTPException(
+                status_code=500,
+                detail=str(exc),
+            ) from exc
+
+        except ValueError as exc:
+
+            raise HTTPException(
+                status_code=400,
+                detail=(
+                    "Semantic Retrieval "
+                    f"validation failed: {exc}"
+                ),
+            ) from exc
+
+        except Exception as exc:
+
+            raise HTTPException(
+                status_code=500,
+                detail=(
+                    "Semantic Retrieval failed: "
+                    f"{exc}"
+                ),
+            ) from exc
+
+        results = result.get(
+            "results",
+            [],
+        )
+
+        if results:
+
+            top_result = results[0]
+
+            top_name = top_result.get(
+                "name",
+                "retrieved scene",
+            )
+
+            top_score = top_result.get(
+                "score",
+                0.0,
+            )
+
+            answer = (
+                f"Found {len(results)} relevant "
+                f"satellite scene(s). The top match "
+                f"is '{top_name}' with a cosine "
+                f"similarity score of "
+                f"{float(top_score):.4f}."
+            )
+
+        else:
+
+            answer = (
+                "No matching satellite scenes "
+                "were found in the current imagery index."
+            )
+
+        trace.extend(
+            [
+                {
+                    "step": "query_embedding",
+                    "status": "completed",
+                    "message": (
+                        "Converted the natural-language "
+                        "query into a RemoteCLIP semantic "
+                        "embedding."
+                    ),
+                },
+                {
+                    "step": "semantic_search",
+                    "status": "completed",
+                    "message": (
+                        f"Searched the indexed remote-sensing "
+                        f"imagery using vector similarity and "
+                        f"returned {len(results)} result(s)."
+                    ),
+                },
+                {
+                    "step": "ranking",
+                    "status": "completed",
+                    "message": (
+                        "Ranked candidate scenes by cosine "
+                        "similarity."
+                    ),
+                },
+                {
+                    "step": "evidence_generation",
+                    "status": "completed",
+                    "message": (
+                        "Returned the matching satellite "
+                        "scenes and similarity scores as "
+                        "retrieval evidence."
+                    ),
+                },
+                {
+                    "step": "confidence_estimation",
+                    "status": "completed",
+                    "message": (
+                        "Used the top semantic similarity "
+                        "score as a retrieval relevance "
+                        "indicator."
+                    ),
+                },
+                {
+                    "step": "response_generation",
+                    "status": "completed",
+                    "message": (
+                        "Generated the ranked semantic "
+                        "retrieval response."
+                    ),
+                },
+            ]
+        )
+
+        return {
+            "task": task,
+            "tool": tool,
+            "query": query,
+
+            "answer": answer,
+
+            "confidence": (
+                float(
+                    results[0].get(
+                        "score",
+                        0.0,
+                    )
+                )
+                if results
+                else 0.0
+            ),
+
+            "confidence_type": (
+                "semantic_similarity"
+            ),
+
+            "confidence_note": (
+                "This score represents semantic "
+                "similarity to the indexed scenes; "
+                "it is not a calibrated probability."
+            ),
+
+            "model": result.get(
+                "model",
+                "RemoteCLIP ViT-B-32",
+            ),
+
+            "search_backend": result.get(
+                "search_backend"
+            ),
+
+            "results": results,
+
+            "evidence": {
+                "retrieved_images": results,
+            },
+
+            "trace": trace,
+        }
+
+    # ========================================================
+    # 6. OPTICAL + SAR
+    # ========================================================
+
+    if tool == "optical_sar":
+
+        if len(
+            request.images
+        ) < 2:
+
+            raise HTTPException(
+                status_code=400,
+                detail=(
+                    "Optical-SAR analysis requires "
+                    "two images: Optical RGB and SAR."
+                ),
+            )
+
+        optical_path = (
+            request.images[0]
+        )
+
+        sar_path = (
+            request.images[1]
+        )
+
+        try:
+
+            result = run_optical_sar(
+                optical_path=optical_path,
+                sar_path=sar_path,
+                question=query,
+                threshold=0.30,
+            )
+
+        except FileNotFoundError as exc:
+
+            raise HTTPException(
+                status_code=400,
+                detail=str(exc),
+            ) from exc
+
+        except ValueError as exc:
+
+            raise HTTPException(
+                status_code=400,
+                detail=(
+                    "Optical-SAR validation failed: "
+                    f"{exc}"
+                ),
+            ) from exc
+
+        except Exception as exc:
+
+            raise HTTPException(
+                status_code=500,
+                detail=(
+                    "Optical-SAR analysis failed: "
+                    f"{exc}"
+                ),
+            ) from exc
+
+        trace.extend(
+            [
+                {
+                    "step": "modality_detection",
+                    "status": "completed",
+                    "message": (
+                        "Detected Optical RGB + SAR "
+                        "multimodal workflow."
+                    ),
+                },
+                {
+                    "step": "task_aware_preprocessing",
+                    "status": "completed",
+                    "message": (
+                        "Applied modality-aware EO/SAR "
+                        "preprocessing."
+                    ),
+                },
+                {
+                    "step": "model_selection",
+                    "status": "completed",
+                    "message": (
+                        "Selected GalaxEye EfficientNet-B0 "
+                        "U-Net EO-SAR specialist model."
+                    ),
+                },
+                {
+                    "step": "inference",
+                    "status": "completed",
+                    "message": (
+                        "Optical-SAR change detection "
+                        "completed."
+                    ),
+                },
+                {
+                    "step": "evidence_generation",
+                    "status": "completed",
+                    "message": (
+                        "Generated change mask, "
+                        "probability map and evidence overlay."
+                    ),
+                },
+                {
+                    "step": "confidence_estimation",
+                    "status": "completed",
+                    "message": (
+                        "Generated model-derived "
+                        "confidence indicator."
+                    ),
+                },
+                {
+                    "step": "response_generation",
+                    "status": "completed",
+                    "message": (
+                        "Natural-language Optical-SAR "
+                        "result generated."
+                    ),
+                },
+            ]
+        )
+
+        return {
+            "task": task,
+            "tool": tool,
+            "query": query,
+
+            "answer": result.get(
+                "answer",
+                "No answer generated.",
+            ),
+
+            "confidence": result.get(
+                "confidence"
+            ),
+
+            "confidence_type": result.get(
+                "confidence_type"
+            ),
+
+            "confidence_note": result.get(
+                "confidence_note"
+            ),
+
+            "change_percentage": result.get(
+                "change_percentage"
+            ),
+
+            "changed_pixels": result.get(
+                "changed_pixels"
+            ),
+
+            "valid_pixels": result.get(
+                "valid_pixels"
+            ),
+
+            "mean_probability": result.get(
+                "mean_probability"
+            ),
+
+            "changed_region_probability": result.get(
+                "changed_region_probability"
+            ),
+
+            "model": result.get(
+                "model"
+            ),
+
+            "device": result.get(
+                "device"
+            ),
+
+            "threshold": result.get(
+                "threshold"
+            ),
+
+            "evidence": {
+                "change_mask": result.get(
+                    "change_mask"
+                ),
+                "change_probability": result.get(
+                    "change_probability"
+                ),
+                "evidence_image": result.get(
+                    "evidence_image"
+                ),
+            },
+
+            "validation": result.get(
+                "validation"
+            ),
+
+            "checkpoint_info": result.get(
+                "checkpoint_info"
+            ),
+
+            "trace": trace,
+        }
+
+    # ========================================================
+    # 7. MULTITEMPORAL CHANGE DETECTION
+    # ========================================================
 
     if tool == "change_detection":
 
         try:
+
             result = run_change_detection(
                 before_path=request.images[0],
                 after_path=request.images[1],
@@ -172,12 +627,14 @@ def analyze(
             )
 
         except FileNotFoundError as exc:
+
             raise HTTPException(
                 status_code=400,
                 detail=str(exc),
             ) from exc
 
         except Exception as exc:
+
             raise HTTPException(
                 status_code=500,
                 detail=(
@@ -216,8 +673,8 @@ def analyze(
                     "step": "response_generation",
                     "status": "completed",
                     "message": (
-                        "Natural-language result "
-                        "generated."
+                        "Natural-language change "
+                        "result generated."
                     ),
                 },
             ]
@@ -227,23 +684,29 @@ def analyze(
             "task": task,
             "tool": tool,
             "query": query,
+
             "answer": result.get(
                 "answer",
                 "No answer generated.",
             ),
+
             "confidence": result.get(
                 "confidence"
             ),
+
             "change_percentage": result.get(
                 "change_percentage"
             ),
+
             "regions": result.get(
                 "regions",
                 [],
             ),
+
             "model": result.get(
                 "model"
             ),
+
             "evidence": {
                 "change_mask": result.get(
                     "change_mask"
@@ -252,31 +715,142 @@ def analyze(
                     "change_overlay"
                 ),
             },
+
             "trace": trace,
         }
 
-    # =========================================================
-    # 6. VQA
-    # =========================================================
+    # ========================================================
+    # 8. GROUNDING
+    # ========================================================
 
-    if tool == "vqa":
+    if tool == "grounding":
+
+        target = extract_grounding_target(
+            query
+        )
 
         try:
-            result = run_vqa(
+
+            result = run_grounding(
                 image_path=request.images[0],
-                question=query,
+                query=target,
             )
 
         except FileNotFoundError as exc:
+
             raise HTTPException(
                 status_code=400,
                 detail=str(exc),
             ) from exc
 
         except Exception as exc:
+
             raise HTTPException(
                 status_code=500,
-                detail=f"VQA failed: {exc}",
+                detail=(
+                    "Grounding failed: "
+                    f"{exc}"
+                ),
+            ) from exc
+
+        trace.extend(
+            [
+                {
+                    "step": "preprocessing",
+                    "status": "completed",
+                    "message": (
+                        "Image prepared for "
+                        "text-guided region grounding."
+                    ),
+                },
+                {
+                    "step": "inference",
+                    "status": "completed",
+                    "message": (
+                        "Grounding DINO region detection "
+                        "completed."
+                    ),
+                },
+                {
+                    "step": "evidence_generation",
+                    "status": "completed",
+                    "message": (
+                        "Detected regions and grounding "
+                        "visualization generated."
+                    ),
+                },
+                {
+                    "step": "response_generation",
+                    "status": "completed",
+                    "message": (
+                        "Grounding result generated."
+                    ),
+                },
+            ]
+        )
+
+        return {
+            "task": task,
+            "tool": tool,
+            "query": query,
+
+            "target": target,
+
+            "answer": result.get(
+                "answer",
+                "No grounding result generated.",
+            ),
+
+            "confidence": result.get(
+                "confidence"
+            ),
+
+            "model": result.get(
+                "model"
+            ),
+
+            "detections": result.get(
+                "detections",
+                [],
+            ),
+
+            "evidence": {
+                "grounding_image": result.get(
+                    "grounding_image"
+                ),
+            },
+
+            "trace": trace,
+        }
+
+    # ========================================================
+    # 9. VQA
+    # ========================================================
+
+    if tool == "vqa":
+
+        try:
+
+            result = run_vqa(
+                image_path=request.images[0],
+                question=query,
+            )
+
+        except FileNotFoundError as exc:
+
+            raise HTTPException(
+                status_code=400,
+                detail=str(exc),
+            ) from exc
+
+        except Exception as exc:
+
+            raise HTTPException(
+                status_code=500,
+                detail=(
+                    "VQA failed: "
+                    f"{exc}"
+                ),
             ) from exc
 
         trace.extend(
@@ -319,53 +893,62 @@ def analyze(
             "task": task,
             "tool": tool,
             "query": query,
+
             "answer": result.get(
                 "answer",
                 "No answer generated.",
             ),
+
             "confidence": result.get(
                 "confidence"
             ),
+
             "model": result.get(
                 "model"
             ),
-            "evidence": {
-                "image": request.images[0],
-            },
+
+            "evidence": result.get(
+                "evidence",
+                {},
+            ),
+
             "trace": trace,
         }
 
-    # =========================================================
-    # 7. GROUNDING
-    # =========================================================
+    # ========================================================
+    # 10. CAPTION / SCENE DESCRIPTION
+    # ========================================================
 
-    if tool == "grounding":
-
-        # Convert:
-        # "Where are the buildings?"
-        # into:
-        # "buildings"
-        grounding_target = extract_grounding_target(
-            query
-        )
+    if (
+        task == "CAPTION"
+        or tool == "caption"
+    ):
 
         try:
-            result = run_grounding(
+
+            result = run_vqa(
                 image_path=request.images[0],
-                query=grounding_target,
+                question=(
+                    "Describe the satellite scene "
+                    "concisely, focusing on the main "
+                    "land-cover types, structures and "
+                    "visible geographic features."
+                ),
             )
 
         except FileNotFoundError as exc:
+
             raise HTTPException(
                 status_code=400,
                 detail=str(exc),
             ) from exc
 
         except Exception as exc:
+
             raise HTTPException(
                 status_code=500,
                 detail=(
-                    "Grounding failed: "
+                    "Scene description failed: "
                     f"{exc}"
                 ),
             ) from exc
@@ -373,155 +956,73 @@ def analyze(
         trace.extend(
             [
                 {
-                    "step": "query_refinement",
-                    "status": "completed",
-                    "message": (
-                        f"Grounding target extracted: "
-                        f"'{grounding_target}'."
-                    ),
-                },
-                {
                     "step": "preprocessing",
                     "status": "completed",
                     "message": (
                         "Image prepared for "
-                        "text-guided grounding."
+                        "remote-sensing scene description."
                     ),
                 },
                 {
                     "step": "inference",
                     "status": "completed",
                     "message": (
-                        "Grounding DINO completed "
-                        "text-guided localization."
+                        "Remote-sensing VLM scene "
+                        "description completed."
                     ),
                 },
                 {
                     "step": "evidence_generation",
                     "status": "completed",
                     "message": (
-                        "Grounded regions and "
-                        "annotated evidence generated."
+                        "Source image retained as "
+                        "visual evidence."
                     ),
                 },
                 {
                     "step": "response_generation",
                     "status": "completed",
                     "message": (
-                        "Grounding result generated."
+                        "Scene description generated."
                     ),
                 },
             ]
         )
 
-        detections = result.get(
-            "detections",
-            [],
-        )
-
-        # More useful answer depending on detection result.
-        if detections:
-            answer = (
-                f"Detected {len(detections)} "
-                f"candidate region(s) for "
-                f"'{grounding_target}'."
-            )
-        else:
-            answer = (
-                f"No confident '{grounding_target}' "
-                "regions were detected."
-            )
-
         return {
             "task": task,
             "tool": tool,
             "query": query,
-            "grounding_target": grounding_target,
-            "answer": answer,
+
+            "answer": result.get(
+                "answer",
+                "No description generated.",
+            ),
+
             "confidence": result.get(
                 "confidence"
             ),
+
             "model": result.get(
                 "model"
             ),
-            "detections": detections,
-            "evidence": {
-                "grounding_image": result.get(
-                    "grounding_image"
-                ),
-            },
-            "trace": trace,
-        }
 
-    # =========================================================
-    # 8. CAPTIONING
-    # =========================================================
-
-    if tool == "caption":
-
-        trace.append(
-            {
-                "step": "inference",
-                "status": "pending",
-                "message": (
-                    "Remote-sensing captioning "
-                    "model is not connected yet."
-                ),
-            }
-        )
-
-        return {
-            "task": task,
-            "tool": tool,
-            "query": query,
-            "answer": (
-                "Remote-sensing captioning "
-                "is not connected yet."
+            "evidence": result.get(
+                "evidence",
+                {},
             ),
-            "confidence": None,
-            "model": None,
-            "evidence": {},
+
             "trace": trace,
         }
 
-    # =========================================================
-    # 9. OPTICAL + SAR
-    # =========================================================
-
-    if tool == "optical_sar":
-
-        trace.append(
-            {
-                "step": "inference",
-                "status": "pending",
-                "message": (
-                    "Optical-SAR specialist "
-                    "model is not connected yet."
-                ),
-            }
-        )
-
-        return {
-            "task": task,
-            "tool": tool,
-            "query": query,
-            "answer": (
-                "Optical-SAR analysis "
-                "is not connected yet."
-            ),
-            "confidence": None,
-            "model": None,
-            "evidence": {},
-            "trace": trace,
-        }
-
-    # =========================================================
-    # 10. UNKNOWN TOOL
-    # =========================================================
+    # ========================================================
+    # 11. UNSUPPORTED TOOL
+    # ========================================================
 
     raise HTTPException(
         status_code=400,
         detail=(
-            f"Unsupported analysis tool: {tool}"
+            f"SatQuery selected unsupported "
+            f"tool '{tool}' for task '{task}'."
         ),
     )
