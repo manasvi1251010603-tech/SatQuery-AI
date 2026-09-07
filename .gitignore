@@ -61,3 +61,11 @@ models/*.safetensors
 third_party/galaxeye-eo-sar/checkpoints/
 third_party/galaxeye-eo-sar/**/__pycache__/
 third_party/galaxeye-eo-sar/**/*.pyc
+
+# GalaxEye generated outputs
+third_party/galaxeye-eo-sar/checkpoints/
+third_party/galaxeye-eo-sar/results/
+third_party/galaxeye-eo-sar/rough/
+third_party/galaxeye-eo-sar/**/__pycache__/
+third_party/galaxeye-eo-sar/**/*.pyc
+third_party/galaxeye-eo-sar/logs/
