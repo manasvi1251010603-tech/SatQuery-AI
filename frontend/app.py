@@ -339,6 +339,96 @@ CSS = r"""<style>
     box-shadow: 0 12px 30px rgba(25,71,51,.06);
 }
 
+.confidence-panel {
+    margin-top: 14px;
+    padding: 18px 20px;
+    border-radius: 18px;
+    border: 1px solid #dce6df;
+    background: rgba(255,255,255,.72);
+    box-shadow: 0 8px 24px rgba(25,71,51,.04);
+}
+
+.confidence-title {
+    margin-top: 3px;
+    color: #75847d;
+    font-size: 9px;
+    letter-spacing: .19em;
+    font-weight: 800;
+}
+
+.confidence-headline {
+    font-size: 24px;
+    font-weight: 790;
+    letter-spacing: -.03em;
+    margin-top: 4px;
+    margin-bottom: 12px;
+}
+
+.confidence-high {
+    color: #2f7d58;
+}
+
+.confidence-medium {
+    color: #9a7a31;
+}
+
+.confidence-low {
+    color: #aa4b4b;
+}
+
+.confidence-level {
+    margin-top: 10px;
+    margin-bottom: 5px;
+    color: #365b49;
+    font-size: 11px;
+    font-weight: 760;
+}
+
+.confidence-item {
+    display: flex;
+    gap: 9px;
+    align-items: flex-start;
+    padding: 5px 0;
+    color: #65756d;
+    font-size: 11px;
+    line-height: 1.45;
+}
+
+.confidence-item.positive {
+    color: #3e6e55;
+}
+
+.confidence-item.caution {
+    color: #8a743a;
+}
+
+.confidence-item.negative {
+    color: #985353;
+}
+
+.confidence-recommendation {
+    margin-top: 14px;
+    padding: 11px 13px;
+    border-radius: 12px;
+    background: #edf5ef;
+    border: 1px solid #d9e8dc;
+}
+
+.confidence-rec-label {
+    color: #668074;
+    font-size: 8px;
+    letter-spacing: .14em;
+    text-transform: uppercase;
+    font-weight: 800;
+}
+
+.confidence-rec-text {
+    color: #335643;
+    font-size: 11px;
+    line-height: 1.5;
+    margin-top: 4px;
+}
+
 .result-answer {
     color: #244739;
     font-size: 14px;
@@ -407,6 +497,62 @@ CSS = r"""<style>
 
 st.markdown(CSS, unsafe_allow_html=True)
 
+st.markdown(
+    r"""<style>
+    /* ========================================================
+       MAIN WORKSPACE BUTTONS
+       Keep navigation dark, but make content buttons clearly
+       visible with the SatQuery green visual language.
+       ======================================================== */
+
+    .main .stButton > button {
+        background: #eef5f0 !important;
+        color: #234b3a !important;
+        border: 1px solid #cfe0d5 !important;
+        box-shadow: 0 1px 0 rgba(17, 55, 40, .02) !important;
+        font-weight: 650 !important;
+    }
+
+    .main .stButton > button:hover {
+        background: #e2f0e7 !important;
+        color: #183d2f !important;
+        border-color: #aecaB7 !important;
+        box-shadow: 0 8px 18px rgba(27, 74, 52, .08) !important;
+    }
+
+    /* Primary Analyze / CTA buttons */
+    .main .stButton > button[kind="primary"] {
+        background: #235e47 !important;
+        color: #f4fbf6 !important;
+        border: 1px solid #235e47 !important;
+        font-weight: 720 !important;
+        box-shadow: 0 8px 20px rgba(35, 94, 71, .16) !important;
+    }
+
+    .main .stButton > button[kind="primary"]:hover {
+        background: #2f7658 !important;
+        color: #ffffff !important;
+        border-color: #2f7658 !important;
+        box-shadow: 0 10px 24px rgba(35, 94, 71, .20) !important;
+    }
+
+    /* Sidebar stays dark and readable. */
+    [data-testid="stSidebar"] .stButton > button {
+        background: rgba(255,255,255,.035) !important;
+        color: #dcece3 !important;
+        border: 1px solid rgba(155,214,179,.12) !important;
+        box-shadow: none !important;
+    }
+
+    [data-testid="stSidebar"] .stButton > button:hover {
+        background: rgba(116,190,145,.14) !important;
+        color: #ffffff !important;
+        border-color: rgba(155,224,181,.28) !important;
+    }
+    </style>""",
+    unsafe_allow_html=True,
+)
+
 
 # ============================================================
 # SIDEBAR
@@ -447,6 +593,509 @@ for icon, page in [
     ):
         st.session_state.page = page
         st.rerun()
+
+
+
+# ============================================================
+# CONFIDENCE ANALYSIS
+# ============================================================
+
+def build_confidence_analysis(
+    result: dict[str, Any],
+) -> dict[str, Any]:
+    """
+    Build an explainable confidence summary from evidence that
+    the backend already returns.
+
+    This is intentionally evidence-based:
+    we do not invent sensor observations that are absent from
+    the backend response.
+    """
+
+    tool = str(
+        result.get("tool", "")
+    ).lower()
+
+    task = str(
+        result.get("task", "")
+    ).lower()
+
+    raw_confidence = result.get(
+        "confidence"
+    )
+
+    try:
+        confidence = (
+            float(raw_confidence)
+            if raw_confidence is not None
+            else None
+        )
+    except Exception:
+        confidence = None
+
+    # Semantic similarity is on a 0-1-ish scale, but should
+    # not be displayed as a probability.
+    semantic = (
+        result.get("confidence_type")
+        == "semantic_similarity"
+    )
+
+    if semantic:
+        score = confidence
+    else:
+        score = confidence
+
+    high_checks: list[str] = []
+    medium_checks: list[str] = []
+    low_checks: list[str] = []
+
+    recommendation = (
+        "Review the evidence overlay before making a final decision."
+    )
+
+    # --------------------------------------------------------
+    # Optical + SAR
+    # --------------------------------------------------------
+
+    if tool == "optical_sar":
+
+        evidence = result.get(
+            "evidence",
+            {},
+        )
+
+        evidence_image = evidence.get(
+            "evidence_image"
+        )
+
+        if evidence_image:
+            high_checks.append(
+                "SAR evidence is available"
+            )
+
+        changed_pixels = result.get(
+            "changed_pixels"
+        )
+
+        valid_pixels = result.get(
+            "valid_pixels"
+        )
+
+        if (
+            changed_pixels is not None
+            and valid_pixels is not None
+            and float(valid_pixels) > 0
+        ):
+            ratio = (
+                float(changed_pixels)
+                / float(valid_pixels)
+            )
+
+            if ratio > 0:
+                high_checks.append(
+                    "Spatial evidence is present in the joint analysis"
+                )
+
+        # If the overall confidence is modest, qualify optical
+        # visibility instead of overstating certainty.
+        if score is not None and score < 0.70:
+            medium_checks.append(
+                "Optical visibility is limited for this scene"
+            )
+
+        elif score is not None and score >= 0.70:
+            high_checks.append(
+                "Joint optical–SAR model confidence is strong"
+            )
+
+        if high_checks:
+            recommendation = (
+                "Use the SAR-supported result and verify the highlighted "
+                "region against the optical observation."
+            )
+        else:
+            recommendation = (
+                "Use the result cautiously and inspect both optical and SAR evidence."
+            )
+
+    # --------------------------------------------------------
+    # Multitemporal change
+    # --------------------------------------------------------
+
+    elif tool == "change_detection":
+
+        method = str(
+            result.get(
+                "method",
+                "",
+            )
+        ).lower()
+
+        regions = result.get(
+            "regions",
+            [],
+        )
+
+        change = result.get(
+            "change_percentage"
+        )
+
+        if method == "adaptformer":
+
+            high_checks.append(
+                "Temporal model agreement is available"
+            )
+
+            if regions:
+                high_checks.append(
+                    "Spatial change regions were identified"
+                )
+
+            if score is not None and score >= 0.70:
+                high_checks.append(
+                    "Change-model confidence is strong"
+                )
+            else:
+                medium_checks.append(
+                    "Change-model confidence is moderate"
+                )
+
+            recommendation = (
+                "Use the model-supported change result and inspect the "
+                "highlighted temporal regions."
+            )
+
+        else:
+
+            # The latest change detector explicitly distinguishes its
+            # visual-difference fallback from AdaptFormer.
+            medium_checks.append(
+                "Temporal image difference is measurable"
+            )
+
+            if regions:
+                high_checks.append(
+                    "Spatially localized change candidates are present"
+                )
+
+            medium_checks.append(
+                "AdaptFormer agreement is limited; visual-difference fallback was used"
+            )
+
+            recommendation = (
+                "Use the change overlay as a candidate-change result; "
+                "verify important regions with the source images."
+            )
+
+    # --------------------------------------------------------
+    # Grounding
+    # --------------------------------------------------------
+
+    elif tool == "grounding":
+
+        detections = result.get(
+            "detections",
+            [],
+        )
+
+        count = len(
+            detections
+            if isinstance(
+                detections,
+                list,
+            )
+            else []
+        )
+
+        if count >= 3:
+
+            high_checks.append(
+                "Multiple spatial detections support the localization"
+            )
+
+        elif count > 0:
+
+            medium_checks.append(
+                "Only a small number of regions were localized"
+            )
+
+        if score is not None:
+
+            if score >= 0.70:
+                high_checks.append(
+                    "Top detection confidence is strong"
+                )
+
+            elif score >= 0.40:
+                medium_checks.append(
+                    "Detection confidence is moderate"
+                )
+
+            else:
+                low_checks.append(
+                    "Detection confidence is low"
+                )
+
+        if high_checks and not low_checks:
+
+            recommendation = (
+                "Use the highlighted spatial regions as the primary "
+                "grounding result."
+            )
+
+        elif medium_checks:
+
+            recommendation = (
+                "Treat the boxes as candidate regions and verify visually."
+            )
+
+        else:
+
+            recommendation = (
+                "Do not rely on the localization without visual verification."
+            )
+
+    # --------------------------------------------------------
+    # Semantic Retrieval
+    # --------------------------------------------------------
+
+    elif tool == "semantic_retrieval":
+
+        retrieval = result.get(
+            "results",
+            [],
+        )
+
+        if retrieval:
+
+            best = retrieval[0]
+
+            try:
+                best_score = float(
+                    best.get(
+                        "score",
+                        0,
+                    )
+                )
+            except Exception:
+                best_score = 0.0
+
+            if best_score >= 0.25:
+
+                high_checks.append(
+                    "Strong semantic match in the indexed imagery"
+                )
+
+            elif best_score >= 0.15:
+
+                medium_checks.append(
+                    "Semantic match is moderate"
+                )
+
+            else:
+
+                low_checks.append(
+                    "Semantic similarity is weak"
+                )
+
+            medium_checks.append(
+                "Retrieval confidence depends on the current image index"
+            )
+
+            recommendation = (
+                "Use the highest-ranked scenes as semantic candidates "
+                "and inspect their imagery."
+            )
+
+        else:
+
+            low_checks.append(
+                "No indexed scene matched the query"
+            )
+
+            recommendation = (
+                "Expand the retrieval index or refine the query."
+            )
+
+    # --------------------------------------------------------
+    # VQA / Caption
+    # --------------------------------------------------------
+
+    elif tool in {
+        "vqa",
+        "caption",
+    }:
+
+        if score is not None:
+
+            if score >= 0.75:
+
+                high_checks.append(
+                    "Remote-sensing vision model confidence is strong"
+                )
+
+            elif score >= 0.45:
+
+                medium_checks.append(
+                    "Remote-sensing vision confidence is moderate"
+                )
+
+            else:
+
+                low_checks.append(
+                    "Vision-model confidence is low"
+                )
+
+        high_checks.append(
+            "Answer is grounded in the supplied satellite image"
+        )
+
+        recommendation = (
+            "Use the paragraph answer together with the source image; "
+            "verify low-confidence interpretations visually."
+        )
+
+    # --------------------------------------------------------
+    # Generic
+    # --------------------------------------------------------
+
+    else:
+
+        if score is not None:
+
+            if score >= 0.75:
+                high_checks.append(
+                    "Overall model confidence is strong"
+                )
+            elif score >= 0.45:
+                medium_checks.append(
+                    "Overall model confidence is moderate"
+                )
+            else:
+                low_checks.append(
+                    "Overall model confidence is low"
+                )
+
+        high_checks.append(
+            "Evidence from the selected analysis workflow is available"
+        )
+
+    # --------------------------------------------------------
+    # Determine headline level
+    # --------------------------------------------------------
+
+    if low_checks and not high_checks:
+
+        level = "Low"
+
+    elif medium_checks and not high_checks:
+
+        level = "Medium"
+
+    elif high_checks and not medium_checks:
+
+        level = "High"
+
+    elif high_checks:
+
+        level = "High"
+
+    elif medium_checks:
+
+        level = "Medium"
+
+    else:
+
+        level = "Low"
+
+    return {
+        "level": level,
+        "high": high_checks,
+        "medium": medium_checks,
+        "low": low_checks,
+        "recommendation": recommendation,
+    }
+
+
+def render_confidence_analysis(
+    result: dict[str, Any],
+) -> None:
+
+    analysis = build_confidence_analysis(
+        result
+    )
+
+    st.markdown(
+        '<div class="confidence-title">CONFIDENCE</div>',
+        unsafe_allow_html=True,
+    )
+
+    # Headline confidence.
+    level = analysis["level"]
+
+    level_class = {
+        "High": "confidence-high",
+        "Medium": "confidence-medium",
+        "Low": "confidence-low",
+    }.get(
+        level,
+        "confidence-medium",
+    )
+
+    st.markdown(
+        f'<div class="confidence-headline {level_class}">{esc(level)}</div>',
+        unsafe_allow_html=True,
+    )
+
+    # High evidence.
+    if analysis["high"]:
+
+        st.markdown(
+            '<div class="confidence-level">High</div>',
+            unsafe_allow_html=True,
+        )
+
+        for item in analysis["high"]:
+
+            st.markdown(
+                f'<div class="confidence-item positive">✓ <span>{esc(item)}</span></div>',
+                unsafe_allow_html=True,
+            )
+
+    # Medium / caution evidence.
+    if analysis["medium"]:
+
+        st.markdown(
+            '<div class="confidence-level">Medium</div>',
+            unsafe_allow_html=True,
+        )
+
+        for item in analysis["medium"]:
+
+            st.markdown(
+                f'<div class="confidence-item caution">△ <span>{esc(item)}</span></div>',
+                unsafe_allow_html=True,
+            )
+
+    # Low evidence.
+    if analysis["low"]:
+
+        st.markdown(
+            '<div class="confidence-level">Low</div>',
+            unsafe_allow_html=True,
+        )
+
+        for item in analysis["low"]:
+
+            st.markdown(
+                f'<div class="confidence-item negative">! <span>{esc(item)}</span></div>',
+                unsafe_allow_html=True,
+            )
+
+    st.markdown(
+        f'<div class="confidence-recommendation"><div class="confidence-rec-label">Recommendation</div><div class="confidence-rec-text">{esc(analysis["recommendation"])}</div></div>',
+        unsafe_allow_html=True,
+    )
 
 
 # ============================================================
@@ -1130,8 +1779,42 @@ elif st.session_state.page == "Analysis":
             unsafe_allow_html=True,
         )
 
+        # ------------------------------------------------
+        # Answer paragraph FIRST
+        # ------------------------------------------------
+
+        answer_text = str(
+            result.get(
+                "answer",
+                "No answer generated.",
+            )
+        ).strip()
+
         st.markdown(
-            f'<div class="result-box"><div class="result-answer">{esc(result.get("answer", "No answer generated."))}</div></div>',
+            '<div class="confidence-title">ANSWER</div>',
+            unsafe_allow_html=True,
+        )
+
+        st.markdown(
+            f'<div class="result-box"><div class="result-answer">{esc(answer_text)}</div></div>',
+            unsafe_allow_html=True,
+        )
+
+        # ------------------------------------------------
+        # Explainable confidence analysis SECOND
+        # ------------------------------------------------
+
+        st.markdown(
+            '<div class="confidence-panel">',
+            unsafe_allow_html=True,
+        )
+
+        render_confidence_analysis(
+            result
+        )
+
+        st.markdown(
+            '</div>',
             unsafe_allow_html=True,
         )
 
