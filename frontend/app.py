@@ -1,11 +1,14 @@
+
 from __future__ import annotations
 
 import html
+import io
 from pathlib import Path
 from typing import Any
 
 import requests
 import streamlit as st
+from PIL import Image
 
 
 # ============================================================
@@ -13,9 +16,15 @@ import streamlit as st
 # ============================================================
 
 API_URL = "http://127.0.0.1:8000"
+
 PROJECT_ROOT = Path(__file__).resolve().parents[1]
 UPLOAD_DIR = PROJECT_ROOT / "data" / "demo" / "uploads"
+RESULTS_DIR = PROJECT_ROOT / "data" / "demo" / "results"
+UI_DIR = PROJECT_ROOT / "data" / "demo" / "ui"
+
 UPLOAD_DIR.mkdir(parents=True, exist_ok=True)
+RESULTS_DIR.mkdir(parents=True, exist_ok=True)
+UI_DIR.mkdir(parents=True, exist_ok=True)
 
 DEMO_OPTICAL = (
     PROJECT_ROOT
@@ -37,7 +46,7 @@ DEMO_SAR = (
 
 
 # ============================================================
-# PAGE
+# STREAMLIT
 # ============================================================
 
 st.set_page_config(
@@ -52,21 +61,15 @@ st.set_page_config(
 # SESSION STATE
 # ============================================================
 
-if "page" not in st.session_state:
-    st.session_state.page = "Home"
-
-if "query" not in st.session_state:
-    st.session_state.query = ""
-
-if "history" not in st.session_state:
-    st.session_state.history = []
-
-if "pending_paths" not in st.session_state:
-    st.session_state.pending_paths = []
+st.session_state.setdefault("page", "Home")
+st.session_state.setdefault("query", "")
+st.session_state.setdefault("pending_paths", [])
+st.session_state.setdefault("history", [])
+st.session_state.setdefault("analysis_mode", "Automatic")
 
 
 # ============================================================
-# HELPERS
+# SAFE HELPERS
 # ============================================================
 
 def esc(value: Any) -> str:
@@ -74,10 +77,13 @@ def esc(value: Any) -> str:
 
 
 def save_uploaded_file(uploaded_file) -> str:
-    output_path = UPLOAD_DIR / uploaded_file.name
-    with open(output_path, "wb") as file:
-        file.write(uploaded_file.getbuffer())
-    return str(output_path)
+    name = Path(uploaded_file.name).name
+    target = UPLOAD_DIR / name
+
+    with open(target, "wb") as f:
+        f.write(uploaded_file.getbuffer())
+
+    return str(target)
 
 
 def add_history(result: dict[str, Any]) -> None:
@@ -93,207 +99,347 @@ def add_history(result: dict[str, Any]) -> None:
     st.session_state.history = st.session_state.history[:10]
 
 
-def looks_like_retrieval_query(text: str) -> bool:
-    lowered = text.lower().strip()
-    terms = [
-        "search satellite images",
-        "search satellite imagery",
-        "search imagery",
-        "search scenes",
-        "search images",
-        "retrieve satellite images",
-        "retrieve satellite imagery",
-        "retrieve imagery",
-        "retrieve scenes",
-        "retrieve images",
-        "find satellite images",
-        "find satellite imagery",
-        "find scenes",
-        "find similar satellite images",
-        "find similar satellite imagery",
-        "find similar scenes",
-        "find similar imagery",
-        "show similar satellite images",
-        "show similar satellite imagery",
-        "show similar scenes",
-        "show similar imagery",
-        "look for satellite images",
-        "look for satellite imagery",
-        "looking for satellite images",
-        "looking for satellite imagery",
-        "similar satellite images",
-        "similar satellite imagery",
-        "similar scenes",
-        "similar imagery",
-        "semantic search",
-        "semantic retrieval",
-    ]
-    return any(term in lowered for term in terms)
+def prepare_preview(path: Path) -> Image.Image | None:
+    if not path.exists():
+        return None
+
+    try:
+        if path.suffix.lower() in {".tif", ".tiff"}:
+            import numpy as np
+            import rasterio
+
+            with rasterio.open(path) as src:
+                if src.count >= 3:
+                    bands = src.read([1, 2, 3]).astype(np.float32)
+                    out = []
+
+                    for band in bands:
+                        finite = np.isfinite(band)
+
+                        if not np.any(finite):
+                            out.append(np.zeros_like(band, dtype=np.uint8))
+                            continue
+
+                        lo, hi = np.percentile(band[finite], [2, 98])
+
+                        if hi <= lo:
+                            norm = np.zeros_like(band, dtype=np.uint8)
+                        else:
+                            norm = np.clip(
+                                (band - lo) / (hi - lo) * 255.0,
+                                0,
+                                255,
+                            ).astype(np.uint8)
+
+                        out.append(norm)
+
+                    array = np.stack(out, axis=-1)
+                    image = Image.fromarray(array, "RGB")
+
+                else:
+                    band = src.read(1).astype(np.float32)
+                    finite = np.isfinite(band)
+
+                    if np.any(finite):
+                        lo, hi = np.percentile(band[finite], [2, 98])
+                        if hi > lo:
+                            band = (band - lo) / (hi - lo) * 255
+
+                    band = np.clip(band, 0, 255).astype(np.uint8)
+                    image = Image.fromarray(
+                        np.stack([band, band, band], axis=-1),
+                        "RGB",
+                    )
+        else:
+            image = Image.open(path).convert("RGB")
+
+        image.thumbnail((1200, 800), Image.Resampling.LANCZOS)
+        return image
+
+    except Exception as exc:
+        print(f"Preview error: {exc}")
+        return None
 
 
-def render_trace(trace: list[dict[str, Any]]) -> None:
-    if not trace:
-        return
-
-    st.markdown(
-        '<div class="section-heading">Execution Trace</div>',
-        unsafe_allow_html=True,
-    )
-    st.caption(
-        "Observable steps performed by the SatQuery orchestration layer."
-    )
-
-    pieces = ['<div class="trace-card">']
-    for index, step in enumerate(trace, start=1):
-        name = esc(step.get("step", f"step_{index}"))
-        status = esc(step.get("status", "completed"))
-        message = esc(step.get("message", ""))
-        pieces.append(
-            f'<div class="trace-row">'
-            f'<span class="trace-dot"></span>'
-            f'<div><div class="trace-title">{index}. {name}'
-            f'<span class="trace-status">{status}</span></div>'
-            f'<div class="trace-message">{message}</div></div>'
-            f'</div>'
-        )
-    pieces.append("</div>")
-    st.markdown("".join(pieces), unsafe_allow_html=True)
+def uploaded_preview(uploaded_file) -> Image.Image | None:
+    try:
+        return Image.open(
+            io.BytesIO(uploaded_file.getvalue())
+        ).convert("RGB")
+    except Exception:
+        return None
 
 
 # ============================================================
-# CSS
+# GLOBAL CSS
+#
+# IMPORTANT:
+# All HTML/CSS strings start at column 0. This prevents
+# Streamlit Markdown from interpreting them as code blocks.
 # ============================================================
 
-st.markdown(
-    """
-<style>
-@import url('https://fonts.googleapis.com/css2?family=DM+Sans:wght@400;500;600;700&family=Space+Grotesk:wght@400;500;600;700&display=swap');
-
-html, body, [class*="css"] { font-family: "DM Sans", sans-serif; }
+CSS = r"""<style>
 .stApp {
-    background: radial-gradient(circle at 68% 4%, rgba(67,134,98,.09), transparent 24%),
-                radial-gradient(circle at 4% 85%, rgba(27,91,68,.07), transparent 25%),
-                #f5f7f4;
-    color: #17261f;
+    background:
+        radial-gradient(circle at 88% 4%, rgba(111,188,145,.12), transparent 25%),
+        radial-gradient(circle at 3% 40%, rgba(72,137,105,.06), transparent 23%),
+        #f5f7f5;
 }
-[data-testid="stAppViewContainer"] { background: transparent; }
-[data-testid="stHeader"] { background: transparent; }
-.block-container { max-width: 1450px; padding-top: .9rem; padding-bottom: 3rem; }
 
-/* Sidebar */
-section[data-testid="stSidebar"] {
-    background: linear-gradient(180deg, #172a24 0%, #10221d 100%);
-    border-right: 1px solid rgba(255,255,255,.07);
+[data-testid="stSidebar"] {
+    background: linear-gradient(180deg, #0b2b22 0%, #0d3025 100%);
+    border-right: 1px solid rgba(255,255,255,.08);
 }
-section[data-testid="stSidebar"] > div { padding: 16px 13px; }
-.sidebar-brand { display:flex; align-items:center; gap:10px; padding:7px 4px 18px; }
-.logo-mark {
-    position:relative; width:38px; height:38px; border-radius:12px;
-    background: radial-gradient(circle at 32% 28%, #c6f5d6 0, #75d39a 18%, #27775a 56%, #15392e 100%);
-    box-shadow: 0 8px 22px rgba(28,101,72,.28);
+
+[data-testid="stSidebar"] * {
+    color: #e8f2eb !important;
 }
-.logo-mark:before { content:""; position:absolute; width:43px; height:16px; left:-3px; top:11px; border:1px solid rgba(231,255,240,.62); border-radius:50%; transform:rotate(-20deg); }
-.logo-mark:after { content:""; position:absolute; width:6px; height:6px; left:16px; top:16px; border-radius:50%; background:white; box-shadow:0 0 10px rgba(221,255,234,.8); }
-.brand-name { font-family:"Space Grotesk",sans-serif; font-weight:700; font-size:20px; color:#f6fbf8; letter-spacing:-.04em; }
-.brand-subtitle { margin-top:3px; font-size:8px; text-transform:uppercase; letter-spacing:.14em; color:rgba(224,244,234,.43); }
-.nav-caption { margin:5px 4px 7px; font-size:9px; text-transform:uppercase; letter-spacing:.14em; color:rgba(228,245,236,.38); }
-.nav-wrap button { border:0 !important; background:transparent !important; color:rgba(238,248,242,.69) !important; justify-content:flex-start !important; box-shadow:none !important; }
-.nav-active button { background:rgba(123,192,154,.16) !important; color:#f2fff6 !important; }
-.sidebar-system { margin-top:16px; padding:12px; border-radius:13px; border:1px solid rgba(220,245,231,.08); background:rgba(255,255,255,.025); }
-.sidebar-system small { color:rgba(225,242,234,.42); font-size:9px; text-transform:uppercase; letter-spacing:.13em; }
-.sidebar-online { margin-top:7px; color:#92e6ae; font-size:11px; font-weight:600; }
-.sidebar-online i { display:inline-block; width:6px; height:6px; margin-right:6px; border-radius:50%; background:#70e39c; box-shadow:0 0 9px rgba(112,227,156,.75); animation:pulse 2s infinite; }
-@keyframes pulse { 0%,100%{opacity:.45} 50%{opacity:1} }
 
-/* Hero */
-.hero {
-    position:relative; overflow:hidden; min-height:380px; border-radius:28px;
-    border:1px solid rgba(24,49,38,.08);
-    background:linear-gradient(120deg,#fbfcfa 0%,#f4f7f3 58%,#eaf0ea 100%);
-    box-shadow:0 18px 50px rgba(36,61,49,.06);
+.block-container {
+    padding-top: 1.4rem;
+    padding-bottom: 2rem;
+    max-width: 1400px;
 }
-.hero-copy { position:relative; z-index:3; padding:50px 52px; max-width:750px; }
-.hero-overline { color:#7c8a84; font-size:10px; text-transform:uppercase; letter-spacing:.17em; }
-.hero-title { margin-top:13px; font-family:"Space Grotesk",sans-serif; font-size:clamp(45px,5vw,72px); font-weight:700; line-height:.93; letter-spacing:-.065em; color:#14221c; }
-.hero-accent { color:#217355; }
-.hero-tagline { margin-top:13px; color:#267254; font-size:18px; font-weight:600; }
-.hero-description { max-width:650px; margin-top:10px; color:#65736d; font-size:14px; line-height:1.65; }
-.hero-pills { display:flex; flex-wrap:wrap; gap:8px; margin-top:22px; }
-.hero-pill { padding:8px 11px; border:1px solid #dfe8e2; border-radius:10px; background:rgba(255,255,255,.68); color:#63716b; font-size:10px; }
-.hero-pill strong { color:#2c6550; }
-.globe { position:absolute; right:-20px; top:-48px; width:470px; height:470px; border-radius:50%; background:radial-gradient(circle at 32% 26%,#effff4 0,#bde4c9 11%,#5ba477 31%,#236747 57%,#0f3f30 78%,#092a21 100%); box-shadow:-24px 20px 65px rgba(26,78,54,.24), inset -28px -20px 65px rgba(0,0,0,.26); }
-.globe:before { content:""; position:absolute; inset:18px; border-radius:50%; background:repeating-radial-gradient(circle,rgba(235,255,241,.10) 0 1px,transparent 2px 22px); opacity:.5; }
-.globe:after { content:""; position:absolute; left:48px; top:82px; width:355px; height:204px; border:1px solid rgba(220,250,229,.33); border-radius:50%; transform:rotate(-18deg); box-shadow:0 0 0 30px rgba(221,250,230,.04),0 0 0 60px rgba(221,250,230,.025); }
-.globe-dot { position:absolute; right:168px; top:151px; width:8px; height:8px; border-radius:50%; background:#d9ffe7; box-shadow:0 0 18px rgba(197,255,217,.9); animation:orbitPulse 2.7s infinite; }
-@keyframes orbitPulse {0%,100%{transform:scale(.8);opacity:.65}50%{transform:scale(1.17);opacity:1}}
 
-/* Cards */
-.section-heading { margin-top:24px; font-family:"Space Grotesk",sans-serif; font-size:19px; font-weight:700; color:#1b2a23; letter-spacing:-.025em; }
-.section-subheading { margin-top:3px; margin-bottom:14px; color:#7b8782; font-size:11px; }
-.card { padding:18px; border:1px solid #dfe7e2; border-radius:18px; background:rgba(255,255,255,.88); box-shadow:0 8px 24px rgba(39,63,51,.035); }
-.card-title { font-family:"Space Grotesk",sans-serif; font-size:15px; font-weight:700; color:#21332b; }
-.card-text { margin-top:5px; color:#74807b; font-size:11px; line-height:1.5; }
-.card-icon { width:38px; height:38px; display:flex; align-items:center; justify-content:center; border-radius:12px; background:#e7f3eb; color:#267455; font-size:17px; }
-.mode-card { position:relative; padding:15px 18px; border:1px solid #dfe7e2; border-radius:15px; background:white; overflow:hidden; }
-.mode-card:before { content:""; position:absolute; left:0; top:0; bottom:0; width:2px; background:linear-gradient(180deg,#55aa7d,transparent); }
-.mode-name { font-family:"Space Grotesk",sans-serif; color:#244136; font-weight:700; font-size:15px; }
-.mode-description { margin-top:4px; color:#7a8781; font-size:10px; }
+.page-kicker {
+    color: #71847a;
+    font-size: 9px;
+    letter-spacing: .18em;
+    text-transform: uppercase;
+    font-weight: 750;
+    margin-bottom: 8px;
+}
 
-/* Inputs */
-[data-testid="stFileUploader"] { border:1px dashed #c9d8cf; border-radius:15px; background:#fbfcfb; }
-[data-baseweb="textarea"] { border:1px solid #dce5df !important; border-radius:14px !important; background:#fbfcfb !important; }
-[data-baseweb="textarea"]:focus-within { border-color:#8cbea0 !important; box-shadow:0 0 0 3px rgba(80,148,105,.06) !important; }
-textarea { color:#22342b !important; font-size:13px !important; }
-[data-testid="stTextArea"] label { display:none; }
+.page-title {
+    color: #17352a;
+    font-size: 52px;
+    line-height: .98;
+    letter-spacing: -.055em;
+    font-weight: 780;
+    margin-bottom: 12px;
+}
 
-/* Buttons */
-.stButton > button { border-radius:11px !important; border:1px solid #d5e2d9 !important; background:white !important; color:#285442 !important; font-weight:600 !important; transition:all .18s ease !important; }
-.stButton > button:hover { transform:translateY(-1px); border-color:#91bba2 !important; box-shadow:0 8px 20px rgba(38,103,70,.08); }
-.primary-action button { background:#26785a !important; color:white !important; border-color:#26785a !important; }
+.page-title span {
+    color: #31825f;
+}
 
-/* Metrics / outputs */
-[data-testid="stMetric"] { min-height:88px; background:white; border:1px solid #dfe7e2; border-radius:14px; }
-[data-testid="stMetricLabel"] { color:#7b8781 !important; font-size:9px !important; text-transform:uppercase; letter-spacing:.09em; }
-[data-testid="stMetricValue"] { color:#244a3a !important; font-family:"Space Grotesk",sans-serif; }
-.result-panel { padding:20px 22px; border-radius:17px; border:1px solid #dfe7e2; background:white; animation:entry .35s ease-out; }
-.result-answer { color:#30453b; font-size:14px; line-height:1.7; }
-@keyframes entry {from{opacity:0;transform:translateY(7px)}to{opacity:1;transform:translateY(0)}}
-.retrieval-card { padding:13px; margin-bottom:12px; border-radius:16px; border:1px solid #dfe7e2; background:white; transition:all .18s ease; }
-.retrieval-card:hover { transform:translateY(-2px); box-shadow:0 10px 24px rgba(38,77,58,.07); }
-.rank-pill { display:inline-block; padding:4px 7px; border-radius:999px; background:#e7f3eb; color:#2c7758; font-size:9px; font-weight:700; letter-spacing:.09em; text-transform:uppercase; }
-.trace-card { padding:4px 14px; border-radius:15px; border:1px solid #dfe7e2; background:#fbfcfb; }
-.trace-row { display:flex; gap:9px; padding:10px 0; border-bottom:1px solid #edf1ee; }
-.trace-row:last-child { border-bottom:none; }
-.trace-dot { width:7px; height:7px; flex-shrink:0; margin-top:5px; border-radius:50%; background:#58a97d; box-shadow:0 0 8px rgba(88,169,125,.34); }
-.trace-title { color:#294139; font-size:11px; font-weight:700; }
-.trace-status { color:#408c67; margin-left:7px; font-size:9px; }
-.trace-message { margin-top:2px; color:#7d8984; font-size:10px; line-height:1.45; }
-div[data-testid="stExpander"] { border-color:#dfe7e2 !important; border-radius:13px !important; background:rgba(255,255,255,.58) !important; }
-[data-testid="stImage"] img { border-radius:12px; }
-.footer { margin-top:38px; padding-top:15px; border-top:1px solid #dfe6e1; color:#8a958f; font-size:10px; }
-</style>
-""",
-    unsafe_allow_html=True,
-)
+.page-subtitle {
+    color: #728079;
+    font-size: 14px;
+    line-height: 1.65;
+    max-width: 780px;
+    margin-bottom: 20px;
+}
+
+.section-heading {
+    color: #17382b;
+    font-size: 22px;
+    font-weight: 760;
+    letter-spacing: -.025em;
+    margin: 19px 0 5px;
+}
+
+.section-subheading {
+    color: #819088;
+    font-size: 11px;
+    line-height: 1.55;
+    margin-bottom: 13px;
+}
+
+.scene-card {
+    border: 1px solid #dbe6df;
+    border-radius: 18px;
+    overflow: hidden;
+    background: rgba(255,255,255,.84);
+    box-shadow: 0 12px 30px rgba(22,62,46,.06);
+    transition: transform .25s ease, box-shadow .25s ease;
+}
+
+.scene-card:hover {
+    transform: translateY(-4px);
+    box-shadow: 0 19px 40px rgba(22,62,46,.11);
+}
+
+.scene-card img {
+    width: 100%;
+    display: block;
+}
+
+.scene-copy {
+    padding: 13px 15px 16px;
+}
+
+.scene-label {
+    color: #688176;
+    font-size: 8px;
+    letter-spacing: .15em;
+    text-transform: uppercase;
+    font-weight: 750;
+}
+
+.scene-title {
+    color: #244738;
+    font-size: 14px;
+    font-weight: 730;
+    margin-top: 6px;
+}
+
+.scene-text {
+    color: #85918b;
+    font-size: 10px;
+    line-height: 1.55;
+    margin-top: 4px;
+}
+
+.feature-card {
+    min-height: 150px;
+    border: 1px solid #dce7e0;
+    border-radius: 17px;
+    background: linear-gradient(145deg, rgba(255,255,255,.86), rgba(242,248,244,.74));
+    padding: 18px;
+    transition: transform .23s ease, box-shadow .23s ease;
+}
+
+.feature-card:hover {
+    transform: translateY(-5px);
+    box-shadow: 0 16px 34px rgba(25,71,51,.09);
+}
+
+.feature-icon {
+    width: 36px;
+    height: 36px;
+    display: flex;
+    align-items: center;
+    justify-content: center;
+    background: #e3f1e8;
+    border-radius: 12px;
+    color: #317857;
+    font-weight: 800;
+    margin-bottom: 12px;
+}
+
+.feature-title {
+    color: #2a4a3b;
+    font-size: 13px;
+    font-weight: 730;
+}
+
+.feature-text {
+    color: #829088;
+    font-size: 10px;
+    line-height: 1.55;
+    margin-top: 6px;
+}
+
+.result-box {
+    padding: 20px 21px;
+    border: 1px solid #d8e6dc;
+    border-radius: 18px;
+    background: linear-gradient(145deg, rgba(255,255,255,.90), rgba(233,245,237,.72));
+    box-shadow: 0 12px 30px rgba(25,71,51,.06);
+}
+
+.result-answer {
+    color: #244739;
+    font-size: 14px;
+    line-height: 1.65;
+}
+
+.trace-row {
+    display: flex;
+    gap: 10px;
+    padding: 10px 0;
+    border-bottom: 1px solid #e2e9e4;
+}
+
+.trace-index {
+    width: 25px;
+    height: 25px;
+    flex: 0 0 auto;
+    border-radius: 50%;
+    background: #e5f2e9;
+    color: #37785a;
+    display: flex;
+    align-items: center;
+    justify-content: center;
+    font-size: 9px;
+    font-weight: 800;
+}
+
+.trace-step {
+    color: #315342;
+    font-size: 10px;
+    font-weight: 740;
+}
+
+.trace-message {
+    color: #7c8b84;
+    font-size: 10px;
+    margin-top: 3px;
+    line-height: 1.4;
+}
+
+.stButton > button {
+    border-radius: 11px !important;
+    border: 1px solid #d7e4dc !important;
+    transition: transform .18s ease, box-shadow .18s ease !important;
+}
+
+.stButton > button:hover {
+    transform: translateY(-2px);
+    box-shadow: 0 8px 19px rgba(24,72,49,.08);
+}
+
+[data-testid="stMetric"] {
+    border: 1px solid #dce7e0;
+    border-radius: 13px;
+    background: rgba(255,255,255,.78);
+}
+
+.footer {
+    color: #8a9690;
+    font-size: 9px;
+    margin-top: 35px;
+    padding-top: 14px;
+    border-top: 1px solid #dde6e0;
+}
+</style>"""
+
+st.markdown(CSS, unsafe_allow_html=True)
 
 
 # ============================================================
-# SIDEBAR NAVIGATION
+# SIDEBAR
 # ============================================================
 
-st.sidebar.markdown(
-    '<div class="sidebar-brand"><div class="logo-mark"></div><div><div class="brand-name">SatQuery</div><div class="brand-subtitle">Remote Sensing Intelligence</div></div></div>',
-    unsafe_allow_html=True,
-)
+SIDEBAR_HTML = r"""<div style="padding:12px 6px 15px;">
+<div style="display:flex;gap:10px;align-items:center;">
+<div style="
+width:40px;height:40px;border-radius:14px;
+background:radial-gradient(circle at 30% 25%,#c8f2d5,#4da879 45%,#123e2f 100%);
+box-shadow:0 0 22px rgba(110,207,154,.22);
+position:relative;"></div>
+<div>
+<div style="font-size:17px;font-weight:780;">SatQuery</div>
+<div style="font-size:8px;letter-spacing:.17em;color:#91ad9f !important;text-transform:uppercase;margin-top:2px;">
+REMOTE SENSING INTELLIGENCE
+</div>
+</div>
+</div>
+</div>
+<div style="font-size:8px;letter-spacing:.18em;color:#77998c !important;text-transform:uppercase;margin:2px 5px 8px;">
+WORKSPACE
+</div>"""
 
-st.sidebar.markdown(
-    '<div class="nav-caption">Workspace</div>',
-    unsafe_allow_html=True,
-)
+st.sidebar.markdown(SIDEBAR_HTML, unsafe_allow_html=True)
 
-for icon, page in [("⌂", "Home"), ("⌁", "Analysis"), ("◷", "History"), ("⚙", "Settings"), ("?", "Help")]:
-    active = "nav-active" if st.session_state.page == page else ""
-    st.sidebar.markdown(f'<div class="nav-wrap {active}">', unsafe_allow_html=True)
+for icon, page in [
+    ("⌂", "Home"),
+    ("⌁", "Analysis"),
+    ("◷", "History"),
+    ("⚙", "Settings"),
+    ("?", "Help"),
+]:
     if st.sidebar.button(
         f"{icon}  {page}",
         key=f"nav_{page}",
@@ -301,146 +447,335 @@ for icon, page in [("⌂", "Home"), ("⌁", "Analysis"), ("◷", "History"), ("�
     ):
         st.session_state.page = page
         st.rerun()
-    st.sidebar.markdown("</div>", unsafe_allow_html=True)
-
-st.sidebar.markdown(
-    '<div class="sidebar-system"><small>SatQuery Core</small><div class="sidebar-online"><i></i>ONLINE</div></div>',
-    unsafe_allow_html=True,
-)
 
 
 # ============================================================
-# HOME PAGE
+# HOME
 # ============================================================
 
 if st.session_state.page == "Home":
 
+    # The hero is rendered in an iframe instead of Markdown.
+    # This completely avoids the "HTML displayed as code" issue.
+    HERO_HTML = r"""
+<!doctype html>
+<html>
+<head>
+<style>
+html,body{margin:0;width:100%;height:100%;font-family:-apple-system,BlinkMacSystemFont,"Segoe UI",sans-serif;background:transparent}
+.hero{height:390px;border-radius:28px;position:relative;overflow:hidden;background:linear-gradient(120deg,#173b2d 0%,#2a654a 50%,#0f261e 100%);color:#effaf3}
+.grid{position:absolute;inset:0;opacity:.16;background-image:linear-gradient(rgba(255,255,255,.13) 1px,transparent 1px),linear-gradient(90deg,rgba(255,255,255,.13) 1px,transparent 1px);background-size:34px 34px}
+.glow{position:absolute;width:480px;height:480px;border-radius:50%;right:-130px;top:-130px;background:radial-gradient(circle,rgba(173,233,193,.17),transparent 67%);animation:pulse 5s ease-in-out infinite}
+.copy{position:absolute;z-index:5;left:50px;top:53px;width:55%}
+.kicker{font-size:9px;letter-spacing:.19em;text-transform:uppercase;color:#a8dfba;font-weight:700;margin-bottom:18px}
+.title{font-size:84px;line-height:.9;letter-spacing:-.065em;font-weight:790}
+.title span{color:#8ed8a9}
+.tag{font-size:21px;font-weight:560;margin-top:17px}
+.desc{color:#bdd2c6;font-size:13px;line-height:1.7;margin-top:11px;max-width:530px}
+.pills{display:flex;gap:8px;flex-wrap:wrap;margin-top:23px}
+.pill{font-size:9px;color:#dcebe2;padding:8px 11px;border:1px solid rgba(255,255,255,.14);background:rgba(255,255,255,.06);border-radius:999px;backdrop-filter:blur(8px)}
+.earth{position:absolute;width:205px;height:205px;right:118px;top:90px;border-radius:50%;background:radial-gradient(circle at 30% 28%,rgba(222,250,231,.40),transparent 8%),radial-gradient(circle at 37% 34%,#75bb8c 0%,#337a58 43%,#173e30 75%,#081d16 100%);box-shadow:inset -18px -12px 30px rgba(0,0,0,.20),18px 25px 48px rgba(0,0,0,.28);animation:float 5.2s ease-in-out infinite}
+.earth:after{content:"";position:absolute;inset:0;border-radius:50%;background:linear-gradient(135deg,rgba(255,255,255,.10),transparent 35%,transparent 65%,rgba(0,0,0,.18))}
+.orbit{position:absolute;width:355px;height:355px;right:42px;top:15px;border:1px solid rgba(180,238,200,.18);border-radius:50%;transform:rotate(-18deg);animation:spin 22s linear infinite}
+.orbit2{position:absolute;width:270px;height:120px;border:1px solid rgba(180,238,200,.13);border-radius:50%;right:83px;top:133px;transform:rotate(-22deg);animation:spin2 13s linear infinite}
+.dot{position:absolute;width:9px;height:9px;border-radius:50%;background:#c0f0ce;right:122px;top:83px;box-shadow:0 0 16px rgba(192,240,206,.85);animation:orbit 4.5s ease-in-out infinite}
+.scan{position:absolute;right:0;top:88px;width:470px;height:1px;background:linear-gradient(90deg,transparent,rgba(190,240,207,.7),transparent);animation:scan 5s ease-in-out infinite}
+@keyframes pulse{50%{transform:scale(1.08);opacity:1}}
+@keyframes float{50%{transform:translateY(-8px) rotate(1deg)}}
+@keyframes spin{to{transform:rotate(342deg)}}
+@keyframes spin2{to{transform:rotate(-382deg)}}
+@keyframes orbit{25%{transform:translate(-13px,5px)}50%{transform:translate(-4px,24px)}75%{transform:translate(13px,7px)}}
+@keyframes scan{0%{transform:translateY(0);opacity:0}20%{opacity:.8}55%{transform:translateY(190px);opacity:.35}80%{opacity:.8}100%{transform:translateY(0);opacity:0}}
+</style>
+</head>
+<body>
+<div class="hero">
+<div class="grid"></div><div class="glow"></div>
+<div class="orbit"></div><div class="orbit2"></div>
+<div class="earth"></div><div class="dot"></div><div class="scan"></div>
+<div class="copy">
+<div class="kicker">Satellite imagery · Real insights</div>
+<div class="title">Sat<span>Query</span></div>
+<div class="tag">Explore the Earth. Find answers.</div>
+<div class="desc">Turn satellite observations into evidence-backed answers using natural language and remote-sensing specialists.</div>
+<div class="pills">
+<div class="pill">Optical + SAR</div>
+<div class="pill">Temporal change</div>
+<div class="pill">Grounded evidence</div>
+</div>
+</div>
+</div>
+</body>
+</html>
+"""
+
+    import streamlit.components.v1 as components
+
+    components.html(
+        HERO_HTML,
+        height=410,
+        scrolling=False,
+    )
+
     st.markdown(
-        '<div class="hero"><div class="globe"></div><div class="globe-dot"></div><div class="hero-copy"><div class="hero-overline">Satellite Imagery · Real Insights</div><div class="hero-title">Sat<span class="hero-accent">Query</span></div><div class="hero-tagline">Explore the Earth. Find answers.</div><div class="hero-description">Upload satellite imagery, ask a natural-language question, and get meaningful insights about our changing planet.</div><div class="hero-pills"><div class="hero-pill"><strong>Multiple sensors</strong></div><div class="hero-pill"><strong>Rich analysis</strong></div><div class="hero-pill"><strong>Visual evidence</strong></div></div></div></div>',
+        '<div class="section-heading">Start an observation</div>',
         unsafe_allow_html=True,
     )
 
     st.markdown(
-        '<div class="section-heading">Start exploring</div><div class="section-subheading">Upload imagery and ask SatQuery what you want to understand.</div>',
+        '<div class="section-subheading">Bring an image into the workspace, then ask the question that matters.</div>',
         unsafe_allow_html=True,
     )
 
-    upload_col, query_col = st.columns([1.0, 1.18], gap="large")
+    c1, c2 = st.columns(
+        [1, 1.25],
+        gap="large",
+    )
 
-    with upload_col:
-        st.markdown(
-            '<div class="card"><div class="card-icon">↑</div><div class="card-title">Upload satellite image(s)</div><div class="card-text">PNG, JPG and TIFF/GeoTIFF inputs are supported.</div></div>',
-            unsafe_allow_html=True,
+    with c1:
+
+        st.subheader("Input imagery")
+
+        st.caption(
+            "PNG, JPG, JPEG, WEBP, BMP, TIFF/GeoTIFF and JP2."
         )
+
         home_uploads = st.file_uploader(
-            "Home imagery",
-            type=["png", "jpg", "jpeg", "tif", "tiff"],
+            "Upload satellite observations",
+            type=[
+                "png",
+                "jpg",
+                "jpeg",
+                "webp",
+                "bmp",
+                "tif",
+                "tiff",
+                "jp2",
+            ],
             accept_multiple_files=True,
             key="home_uploads",
-            label_visibility="collapsed",
         )
 
-    with query_col:
-        st.markdown(
-            '<div class="card">',
-            unsafe_allow_html=True,
-        )
-        st.markdown(
-            '<div class="card-title">Ask a question</div><div class="card-text">Describe what you want to discover. SatQuery handles the workflow selection.</div>',
-            unsafe_allow_html=True,
-        )
+        if home_uploads:
+
+            cols = st.columns(
+                min(2, len(home_uploads))
+            )
+
+            for index, uploaded in enumerate(
+                home_uploads
+            ):
+
+                image = uploaded_preview(
+                    uploaded
+                )
+
+                if image:
+
+                    with cols[
+                        index % len(cols)
+                    ]:
+
+                        st.image(
+                            image,
+                            caption=uploaded.name,
+                            use_container_width=True,
+                        )
+
+    with c2:
+
+        st.subheader("Natural-language mission")
+
         home_query = st.text_area(
-            "Home question",
+            "Question",
             value=st.session_state.query,
             placeholder=(
-                "e.g. What are the buildings?\n"
-                "What land-use changes are visible?\n"
-                "Find satellite scenes showing vegetation."
+                "Where are the buildings?\n"
+                "What changed between these images?\n"
+                "Compare the optical and SAR observations."
             ),
-            height=105,
-            key="home_query_box",
-            label_visibility="collapsed",
+            height=125,
+            key="home_query",
         )
 
         if st.button(
-            "Analyze  →",
-            key="home_analyze",
+            "Enter analysis workspace  →",
             type="primary",
             use_container_width=True,
+            key="home_start",
         ):
-            if home_query.strip():
-                st.session_state.query = home_query.strip()
-                saved = []
-                for uploaded_file in home_uploads or []:
-                    saved.append(save_uploaded_file(uploaded_file))
-                st.session_state.pending_paths = saved
-                st.session_state.page = "Analysis"
-                st.rerun()
-            else:
+
+            if not home_query.strip():
+
                 st.error("Enter a question first.")
 
-        st.markdown(
-            '</div>',
-            unsafe_allow_html=True,
-        )
+            else:
+
+                st.session_state.query = (
+                    home_query.strip()
+                )
+
+                st.session_state.pending_paths = [
+                    save_uploaded_file(file)
+                    for file in (home_uploads or [])
+                ]
+
+                st.session_state.page = "Analysis"
+                st.rerun()
 
     st.markdown(
-        '<div class="section-heading">What can you explore?</div><div class="section-subheading">SatQuery combines remote-sensing models into a single analysis experience.</div>',
+        '<div class="section-heading">From the satellite feed</div>',
+        unsafe_allow_html=True,
+    )
+
+    st.markdown(
+        '<div class="section-subheading">Real remote-sensing imagery from the prototype.</div>',
+        unsafe_allow_html=True,
+    )
+
+    real1, real2 = st.columns(
+        2,
+        gap="large",
+    )
+
+    optical_preview = prepare_preview(
+        DEMO_OPTICAL
+    )
+
+    sar_preview = prepare_preview(
+        DEMO_SAR
+    )
+
+    with real1:
+
+        if optical_preview:
+
+            st.image(
+                optical_preview,
+                caption="OPTICAL · Earth observation",
+                use_container_width=True,
+            )
+
+            st.caption(
+                "Real optical observation used by the prototype."
+            )
+
+    with real2:
+
+        if sar_preview:
+
+            st.image(
+                sar_preview,
+                caption="SAR · Radar observation",
+                use_container_width=True,
+            )
+
+            st.caption(
+                "Real radar observation used by the prototype."
+            )
+
+    st.markdown(
+        '<div class="section-heading">What can SatQuery discover?</div>',
         unsafe_allow_html=True,
     )
 
     features = [
-        ("▥", "Identify", "Find buildings, roads, water bodies, vegetation and more."),
-        ("▱", "Analyze", "Understand land use, terrain and environmental patterns."),
-        ("◫", "Detect", "Discover temporal changes and extract key insights."),
-        ("⌘", "Multi-sensor", "Work with optical and SAR imagery for broader understanding."),
+        (
+            "⌖",
+            "Ground",
+            "Locate buildings, roads, vehicles, vegetation and requested regions.",
+        ),
+        (
+            "◫",
+            "Change",
+            "Compare observations across time and identify candidate change regions.",
+        ),
+        (
+            "◒",
+            "Multi-sensor",
+            "Analyze complementary optical and SAR observations in one workflow.",
+        ),
+        (
+            "⌘",
+            "Retrieve",
+            "Search indexed satellite scenes using semantic similarity.",
+        ),
     ]
 
-    feature_cols = st.columns(4)
-    for index, (icon, title, description) in enumerate(features):
-        with feature_cols[index]:
+    cols = st.columns(4, gap="medium")
+
+    for index, (
+        icon,
+        title,
+        description,
+    ) in enumerate(features):
+
+        with cols[index]:
+
             st.markdown(
-                f'<div class="card"><div class="card-icon">{icon}</div><div class="card-title">{title}</div><div class="card-text">{description}</div></div>',
+                f'<div class="feature-card"><div class="feature-icon">{esc(icon)}</div><div class="feature-title">{esc(title)}</div><div class="feature-text">{esc(description)}</div></div>',
                 unsafe_allow_html=True,
             )
 
 
 # ============================================================
-# ANALYSIS PAGE
+# ANALYSIS
 # ============================================================
 
 elif st.session_state.page == "Analysis":
 
     st.markdown(
-        '<div class="section-heading">Analysis</div><div class="section-subheading">Choose a workflow or let SatQuery decide automatically.</div>',
+        '<div class="page-kicker">Workspace</div>',
         unsafe_allow_html=True,
     )
+
+    st.markdown(
+        '<div class="page-title">Ask the <span>Earth</span>.</div>',
+        unsafe_allow_html=True,
+    )
+
+    st.markdown(
+        '<div class="page-subtitle">Upload imagery, describe the mission in natural language, and let SatQuery select the specialist remote-sensing workflow.</div>',
+        unsafe_allow_html=True,
+    )
+
+    modes = [
+        "Automatic",
+        "Semantic Retrieval",
+        "Optical + SAR",
+        "Multitemporal Change",
+        "Grounding / Localization",
+        "Remote-Sensing VQA",
+    ]
 
     analysis_mode = st.selectbox(
         "Workflow",
-        [
-            "Automatic",
-            "Semantic Retrieval",
-            "Optical + SAR",
-            "Multitemporal Change",
-            "Grounding / Localization",
-            "Remote-Sensing VQA",
-        ],
-        key="analysis_mode",
+        modes,
+        index=modes.index(
+            st.session_state.analysis_mode
+        ),
+        key="workflow_select",
     )
 
-    mode_description = {
-        "Automatic": "SatQuery selects the remote-sensing specialist from your query and inputs.",
-        "Semantic Retrieval": "Search indexed satellite scenes using natural-language semantics.",
-        "Optical + SAR": "Analyze complementary optical and SAR observations together.",
-        "Multitemporal Change": "Detect and localize changes between two observations.",
-        "Grounding / Localization": "Locate requested objects or regions inside satellite imagery.",
-        "Remote-Sensing VQA": "Ask visual questions about satellite observations.",
-    }[analysis_mode]
+    st.session_state.analysis_mode = analysis_mode
 
-    st.markdown(
-        f'<div class="mode-card"><div class="mode-name">{esc(analysis_mode)}</div><div class="mode-description">{esc(mode_description)}</div></div>',
-        unsafe_allow_html=True,
+    descriptions = {
+        "Automatic":
+            "SatQuery selects the specialist workflow from your query and imagery.",
+        "Semantic Retrieval":
+            "Search indexed satellite scenes using natural-language semantics.",
+        "Optical + SAR":
+            "Analyze complementary optical and radar observations together.",
+        "Multitemporal Change":
+            "Compare two observations and identify candidate temporal changes.",
+        "Grounding / Localization":
+            "Locate requested objects or regions within the satellite image.",
+        "Remote-Sensing VQA":
+            "Ask visual questions about the satellite observation.",
+    }
+
+    st.info(
+        descriptions[analysis_mode]
     )
 
     optical_file = None
@@ -448,465 +783,881 @@ elif st.session_state.page == "Analysis":
     uploaded_files = []
     use_demo = False
 
+    st.markdown(
+        '<div class="section-heading">Observation inputs</div>',
+        unsafe_allow_html=True,
+    )
+
     if analysis_mode == "Semantic Retrieval":
-        st.info(
-            "Semantic Retrieval searches the indexed imagery. No upload is required."
+
+        st.caption(
+            "Semantic Retrieval searches the indexed image collection."
         )
 
     elif analysis_mode == "Optical + SAR":
+
         a, b = st.columns(2)
+
         with a:
+
             optical_file = st.file_uploader(
-                "Optical RGB GeoTIFF",
+                "Optical GeoTIFF",
                 type=["tif", "tiff"],
                 key="analysis_optical",
             )
+
         with b:
+
             sar_file = st.file_uploader(
                 "SAR GeoTIFF",
                 type=["tif", "tiff"],
                 key="analysis_sar",
             )
 
-        with st.expander("Use verified BRIGHT demo pair"):
-            if DEMO_OPTICAL.exists() and DEMO_SAR.exists():
-                st.success("Verified Optical + SAR demo pair available.")
-                use_demo = st.checkbox(
-                    "Use demo pair",
-                    key="use_demo_pair",
-                )
-            else:
-                st.warning("Demo pair not found in the local project.")
+        if (
+            DEMO_OPTICAL.exists()
+            and DEMO_SAR.exists()
+        ):
+
+            use_demo = st.checkbox(
+                "Use verified BRIGHT optical + SAR pair",
+                key="analysis_demo_pair",
+            )
 
     else:
+
         uploaded_files = st.file_uploader(
             "Satellite imagery",
-            type=["png", "jpg", "jpeg", "tif", "tiff"],
+            type=[
+                "png",
+                "jpg",
+                "jpeg",
+                "webp",
+                "bmp",
+                "tif",
+                "tiff",
+                "jp2",
+            ],
             accept_multiple_files=True,
             key="analysis_uploads",
         )
 
-    query = st.text_area(
-        "Mission query",
-        value=st.session_state.query,
-        placeholder=(
-            "Ask SatQuery what you want to understand from the imagery..."
-        ),
-        height=120,
-        key="analysis_query",
-        label_visibility="collapsed",
+        if uploaded_files:
+
+            cols = st.columns(
+                min(3, len(uploaded_files))
+            )
+
+            for index, uploaded in enumerate(
+                uploaded_files
+            ):
+
+                image = uploaded_preview(
+                    uploaded
+                )
+
+                if image:
+
+                    with cols[
+                        index % len(cols)
+                    ]:
+
+                        st.image(
+                            image,
+                            caption=uploaded.name,
+                            use_container_width=True,
+                        )
+
+    st.markdown(
+        '<div class="section-heading">Mission query</div>',
+        unsafe_allow_html=True,
     )
 
-    quick_queries = [
+    query = st.text_area(
+        "Query",
+        value=st.session_state.query,
+        placeholder=(
+            "Where are the buildings?\n"
+            "What changed between these two images?\n"
+            "Compare the optical and SAR imagery."
+        ),
+        height=118,
+        key="analysis_query",
+    )
+
+    q1, q2 = st.columns(2)
+
+    quick = [
         "Where are the buildings?",
         "What changed between these two images?",
         "Compare the optical and SAR imagery.",
         "Find satellite images of residential areas.",
     ]
 
-    st.caption("Example queries")
-    qcols = st.columns(2)
-    for index, prompt in enumerate(quick_queries):
-        with qcols[index % 2]:
+    for index, prompt in enumerate(quick):
+
+        with (q1 if index % 2 == 0 else q2):
+
             if st.button(
                 prompt,
-                key=f"analysis_quick_{index}",
+                key=f"quick_{index}",
                 use_container_width=True,
             ):
+
                 st.session_state.query = prompt
                 st.rerun()
 
-    if st.session_state.pending_paths:
-        with st.expander("Imagery carried from Home", expanded=False):
-            for path in st.session_state.pending_paths:
-                st.code(path)
-
     if st.button(
-        "Analyze  →",
-        key="analysis_run",
+        "Analyze observation  →",
+        key="run_analysis",
         type="primary",
         use_container_width=True,
     ):
 
         if not query.strip():
-            st.error("Please enter a query.")
+
+            st.error(
+                "Please enter a mission query."
+            )
+
             st.stop()
 
         image_paths: list[str] = []
 
         if analysis_mode == "Semantic Retrieval":
+
             image_paths = []
 
         elif analysis_mode == "Optical + SAR":
+
             if use_demo:
-                image_paths = [str(DEMO_OPTICAL), str(DEMO_SAR)]
-            else:
-                if not optical_file or not sar_file:
-                    st.error("Please upload both the Optical RGB and SAR imagery.")
-                    st.stop()
+
                 image_paths = [
-                    save_uploaded_file(optical_file),
-                    save_uploaded_file(sar_file),
+                    str(DEMO_OPTICAL),
+                    str(DEMO_SAR),
+                ]
+
+            else:
+
+                if not optical_file or not sar_file:
+
+                    st.error(
+                        "Upload both Optical and SAR imagery."
+                    )
+
+                    st.stop()
+
+                image_paths = [
+                    save_uploaded_file(
+                        optical_file
+                    ),
+                    save_uploaded_file(
+                        sar_file
+                    ),
                 ]
 
         else:
+
             if uploaded_files:
+
                 image_paths = [
-                    save_uploaded_file(file)
+                    save_uploaded_file(
+                        file
+                    )
                     for file in uploaded_files
                 ]
+
             elif st.session_state.pending_paths:
-                image_paths = list(st.session_state.pending_paths)
-            elif analysis_mode == "Automatic" and looks_like_retrieval_query(query):
-                image_paths = []
+
+                image_paths = list(
+                    st.session_state.pending_paths
+                )
+
+            elif analysis_mode == "Automatic":
+
+                text = query.lower()
+
+                retrieval_terms = [
+                    "find satellite",
+                    "search satellite",
+                    "retrieve satellite",
+                    "semantic search",
+                    "similar imagery",
+                    "similar satellite",
+                ]
+
+                if any(
+                    term in text
+                    for term in retrieval_terms
+                ):
+
+                    image_paths = []
+
+                else:
+
+                    st.error(
+                        "Please upload at least one satellite image."
+                    )
+
+                    st.stop()
+
             else:
-                st.error("Please upload at least one satellite image.")
+
+                st.error(
+                    "Please upload at least one satellite image."
+                )
+
                 st.stop()
 
         effective_query = query.strip()
 
         if analysis_mode == "Optical + SAR":
-            lowered = effective_query.lower()
-            if "optical" not in lowered and "sar" not in lowered:
-                effective_query = "Perform Optical and SAR analysis. " + effective_query
+
+            if not (
+                "optical" in effective_query.lower()
+                or "sar" in effective_query.lower()
+            ):
+
+                effective_query = (
+                    "Perform Optical and SAR analysis. "
+                    + effective_query
+                )
 
         elif analysis_mode == "Multitemporal Change":
-            lowered = effective_query.lower()
-            if "change" not in lowered and "changed" not in lowered:
-                effective_query = "Perform multitemporal change analysis. " + effective_query
+
+            if not any(
+                word in effective_query.lower()
+                for word in [
+                    "change",
+                    "changed",
+                ]
+            ):
+
+                effective_query = (
+                    "Perform multitemporal change analysis. "
+                    + effective_query
+                )
 
         elif analysis_mode == "Grounding / Localization":
-            lowered = effective_query.lower()
-            if not any(word in lowered for word in ["where", "locate", "highlight", "find", "identify"]):
-                effective_query = "Locate and highlight " + effective_query
+
+            if not any(
+                word in effective_query.lower()
+                for word in [
+                    "where",
+                    "locate",
+                    "highlight",
+                    "find",
+                    "identify",
+                ]
+            ):
+
+                effective_query = (
+                    "Locate and highlight "
+                    + effective_query
+                )
 
         try:
-            with st.spinner("SatQuery is analyzing the Earth observation..."):
+
+            with st.spinner(
+                "SatQuery is planning and executing the observation..."
+            ):
+
                 response = requests.post(
                     f"{API_URL}/api/analyze",
-                    json={"query": effective_query, "images": image_paths},
+                    json={
+                        "query": effective_query,
+                        "images": image_paths,
+                    },
                     timeout=600,
                 )
 
             if response.status_code != 200:
-                st.error(f"Analysis failed ({response.status_code})")
+
+                st.error(
+                    f"Analysis failed ({response.status_code})"
+                )
+
                 try:
-                    detail = response.json().get("detail", response.text)
+                    detail = response.json().get(
+                        "detail",
+                        response.text,
+                    )
                 except Exception:
                     detail = response.text
+
                 st.code(str(detail))
                 st.stop()
 
             result = response.json()
 
         except requests.exceptions.ConnectionError:
-            st.error("Cannot connect to the SatQuery backend.")
-            st.code("uvicorn backend.app.main:app --reload")
+
+            st.error(
+                "Cannot connect to the SatQuery backend."
+            )
+
+            st.code(
+                "uvicorn backend.app.main:app --reload"
+            )
+
             st.stop()
+
         except requests.exceptions.Timeout:
-            st.error("The analysis timed out.")
+
+            st.error(
+                "The analysis timed out."
+            )
+
             st.stop()
+
         except Exception as exc:
-            st.error(f"Request failed: {exc}")
+
+            st.error(
+                f"Request failed: {exc}"
+            )
+
             st.stop()
 
         st.session_state.query = query.strip()
         st.session_state.pending_paths = image_paths
+
         add_history(result)
 
         st.divider()
+
         st.markdown(
-            '<div class="section-heading">SatQuery Result</div>',
+            '<div class="section-heading">SatQuery result</div>',
             unsafe_allow_html=True,
         )
 
         st.markdown(
-            f'<div class="result-panel"><div class="result-answer">{esc(result.get("answer", "No answer generated."))}</div></div>',
+            f'<div class="result-box"><div class="result-answer">{esc(result.get("answer", "No answer generated."))}</div></div>',
             unsafe_allow_html=True,
         )
 
         m1, m2, m3, m4 = st.columns(4)
 
         with m1:
-            st.metric("Task", result.get("task", "—"))
+            st.metric(
+                "Task",
+                result.get("task", "—"),
+            )
 
         with m2:
-            st.metric("Tool", result.get("tool", "—"))
+            st.metric(
+                "Tool",
+                result.get("tool", "—"),
+            )
 
         with m3:
+
             confidence = result.get("confidence")
+
             if confidence is None:
-                value = "—"
+                display = "—"
             elif result.get("confidence_type") == "semantic_similarity":
-                value = f"{float(confidence):.4f}"
+                display = f"{float(confidence):.4f}"
             else:
-                value = f"{float(confidence) * 100:.1f}%"
-            st.metric("Confidence / Score", value)
+                display = f"{float(confidence) * 100:.1f}%"
+
+            st.metric(
+                "Confidence / Score",
+                display,
+            )
 
         with m4:
-            change = result.get("change_percentage")
-            value = "—" if change is None else f"{float(change):.2f}%"
-            st.metric("Changed", value)
 
-        metadata = []
+            change = result.get(
+                "change_percentage"
+            )
+
+            st.metric(
+                "Changed",
+                "—"
+                if change is None
+                else f"{float(change):.2f}%",
+            )
+
         if result.get("model"):
-            metadata.append(f"Model: {result.get('model')}")
-        if result.get("device"):
-            metadata.append(f"Device: {result.get('device')}")
-        if result.get("search_backend"):
-            metadata.append(f"Search: {result.get('search_backend')}")
-        if metadata:
-            st.caption("  ·  ".join(metadata))
+            st.caption(
+                f"Model: {result['model']}"
+            )
 
-        evidence = result.get("evidence", {})
+        evidence = result.get(
+            "evidence",
+            {},
+        )
 
         # ----------------------------------------------------
-        # Semantic Retrieval
+        # RETRIEVAL
         # ----------------------------------------------------
+
         if result.get("tool") == "semantic_retrieval":
+
             st.markdown(
-                '<div class="section-heading">Scene Retrieval</div>',
+                '<div class="section-heading">Scene retrieval</div>',
                 unsafe_allow_html=True,
             )
-            st.caption(
-                "Ranked satellite scenes using RemoteCLIP semantic similarity."
-            )
+
             retrieval_results = result.get(
                 "results",
-                evidence.get("retrieved_images", []),
+                evidence.get(
+                    "retrieved_images",
+                    [],
+                ),
             )
+
             if retrieval_results:
-                for index, item in enumerate(retrieval_results, start=1):
+
+                for index, item in enumerate(
+                    retrieval_results,
+                    1,
+                ):
+
                     if not isinstance(item, dict):
                         continue
-                    image_path = item.get("path")
+
+                    path_value = item.get("path")
+                    score = item.get("score")
                     name = item.get(
                         "name",
-                        Path(image_path).name if image_path else f"Scene {index}",
+                        Path(
+                            path_value
+                        ).name
+                        if path_value
+                        else f"Scene {index}",
                     )
-                    score = item.get("score")
-                    st.markdown(
-                        '<div class="retrieval-card">',
-                        unsafe_allow_html=True,
-                    )
-                    left, right = st.columns([1, 1.6])
-                    with left:
-                        if image_path:
-                            path = Path(image_path)
-                            if path.exists():
-                                st.image(
-                                    str(path),
-                                    caption=f"Rank {index}",
-                                    use_container_width=True,
-                                )
-                            else:
-                                st.warning("Retrieved image file not found.")
-                    with right:
-                        st.markdown(
-                            f'<span class="rank-pill">Rank {index}</span>',
-                            unsafe_allow_html=True,
+
+                    if path_value and Path(path_value).exists():
+
+                        st.image(
+                            path_value,
+                            caption=(
+                                f"Rank {index} · {name}"
+                            ),
+                            use_container_width=True,
                         )
-                        st.markdown(f"### {esc(name)}")
-                        if score is not None:
-                            st.metric(
-                                "Semantic Similarity",
-                                f"{float(score):.4f}",
-                            )
-                        if image_path:
-                            with st.expander("Source path"):
-                                st.code(str(image_path))
-                    st.markdown("</div>", unsafe_allow_html=True)
-            else:
-                st.info("No matching scenes were found in the current retrieval index.")
 
-        # ----------------------------------------------------
-        # Grounding
-        # ----------------------------------------------------
-        if result.get("tool") == "grounding":
-            st.markdown(
-                '<div class="section-heading">Grounding Map</div>',
-                unsafe_allow_html=True,
-            )
-            grounding_image = evidence.get("grounding_image")
-            if grounding_image:
-                path = Path(grounding_image)
-                if path.exists():
-                    st.image(
-                        str(path),
-                        caption="Text-guided region localization",
-                        use_container_width=True,
-                    )
-            detections = result.get("detections", [])
-            for index, detection in enumerate(detections, start=1):
-                if not isinstance(detection, dict):
-                    continue
-                label = detection.get("label", detection.get("phrase", "object"))
-                score = detection.get("score", detection.get("confidence"))
-                box = detection.get("box", detection.get("bbox"))
-                st.write(f"**Region {index}** — {label}")
-                c1, c2 = st.columns(2)
-                with c1:
                     if score is not None:
-                        try:
-                            st.write(f"Confidence: {float(score) * 100:.1f}%")
-                        except Exception:
-                            st.write(f"Confidence: {score}")
-                with c2:
-                    if box is not None:
-                        st.write(f"Box: {box}")
 
-        # ----------------------------------------------------
-        # Optical + SAR
-        # ----------------------------------------------------
-        if result.get("tool") == "optical_sar":
-            st.markdown(
-                '<div class="section-heading">Optical–SAR Evidence</div>',
-                unsafe_allow_html=True,
-            )
-            evidence_image = evidence.get("evidence_image")
-            if evidence_image:
-                path = Path(evidence_image)
-                if path.exists():
-                    st.image(
-                        str(path),
-                        caption="Optical + SAR analysis",
-                        use_container_width=True,
-                    )
-            c1, c2, c3 = st.columns(3)
-            with c1:
-                value = result.get("changed_pixels")
-                if value is not None:
-                    st.metric("Changed Pixels", f"{int(value):,}")
-            with c2:
-                value = result.get("valid_pixels")
-                if value is not None:
-                    st.metric("Valid Pixels", f"{int(value):,}")
-            with c3:
-                value = result.get("changed_region_probability")
-                if value is not None:
-                    st.metric("Region Probability", f"{float(value):.3f}")
+                        st.caption(
+                            f"Semantic similarity: {float(score):.4f}"
+                        )
 
-        # ----------------------------------------------------
-        # Multitemporal
-        # ----------------------------------------------------
-        if result.get("tool") == "change_detection":
-            st.markdown(
-                '<div class="section-heading">Temporal Change Evidence</div>',
-                unsafe_allow_html=True,
-            )
-            change_overlay = evidence.get("change_overlay")
-            if change_overlay:
-                path = Path(change_overlay)
-                if path.exists():
-                    st.image(
-                        str(path),
-                        caption="Detected temporal change",
-                        use_container_width=True,
-                    )
-            regions = result.get("regions", [])
-            for index, region in enumerate(regions, start=1):
-                st.write(
-                    f"**Region {index}:** "
-                    f"x={region.get('x')} · y={region.get('y')} · "
-                    f"width={region.get('width')} · height={region.get('height')}"
+            else:
+
+                st.info(
+                    "No matching satellite scenes were found."
                 )
 
         # ----------------------------------------------------
-        # VQA / caption
+        # GROUNDING
         # ----------------------------------------------------
-        if result.get("tool") == "vqa":
+
+        if result.get("tool") == "grounding":
+
             st.markdown(
-                '<div class="section-heading">Remote-Sensing Vision</div>',
+                '<div class="section-heading">Grounding map</div>',
                 unsafe_allow_html=True,
             )
-            source_image = evidence.get("image") or evidence.get("source_image")
-            if source_image:
-                path = Path(source_image)
-                if path.exists():
+
+            grounding_image = evidence.get(
+                "grounding_image"
+            )
+
+            if grounding_image and Path(
+                grounding_image
+            ).exists():
+
+                st.image(
+                    grounding_image,
+                    caption="Text-guided remote-sensing grounding",
+                    use_container_width=True,
+                )
+
+            detections = result.get(
+                "detections",
+                [],
+            )
+
+            if detections:
+
+                st.markdown(
+                    '<div class="section-subheading">Detected regions</div>',
+                    unsafe_allow_html=True,
+                )
+
+                for index, detection in enumerate(
+                    detections,
+                    1,
+                ):
+
+                    label = detection.get(
+                        "label",
+                        "object",
+                    )
+
+                    score = detection.get(
+                        "score",
+                        detection.get(
+                            "confidence"
+                        ),
+                    )
+
+                    box = detection.get(
+                        "box",
+                        detection.get(
+                            "bbox"
+                        ),
+                    )
+
+                    c1, c2, c3 = st.columns(3)
+
+                    with c1:
+                        st.write(
+                            f"**Region {index}**"
+                        )
+                        st.caption(
+                            str(label)
+                        )
+
+                    with c2:
+
+                        if score is not None:
+
+                            st.write(
+                                f"Confidence: {float(score) * 100:.1f}%"
+                            )
+
+                    with c3:
+
+                        if box is not None:
+                            st.write(
+                                f"Box: {box}"
+                            )
+
+            else:
+
+                st.info(
+                    "No grounding detections were returned."
+                )
+
+        # ----------------------------------------------------
+        # MULTITEMPORAL
+        # ----------------------------------------------------
+
+        if result.get("tool") == "change_detection":
+
+            st.markdown(
+                '<div class="section-heading">Temporal change evidence</div>',
+                unsafe_allow_html=True,
+            )
+
+            overlay = evidence.get(
+                "change_overlay"
+            )
+
+            if overlay and Path(
+                overlay
+            ).exists():
+
+                st.image(
+                    overlay,
+                    caption="Candidate temporal changes",
+                    use_container_width=True,
+                )
+
+            mask = evidence.get(
+                "change_mask"
+            )
+
+            if mask and Path(mask).exists():
+
+                with st.expander(
+                    "View change mask"
+                ):
+
                     st.image(
-                        str(path),
-                        caption="Source satellite observation",
+                        mask,
                         use_container_width=True,
                     )
 
+            difference = evidence.get(
+                "change_difference"
+            )
+
+            if difference and Path(
+                difference
+            ).exists():
+
+                with st.expander(
+                    "View visual difference"
+                ):
+
+                    st.image(
+                        difference,
+                        use_container_width=True,
+                    )
+
+            regions = result.get(
+                "regions",
+                [],
+            )
+
+            if regions:
+
+                st.markdown(
+                    '<div class="section-subheading">Candidate changed regions</div>',
+                    unsafe_allow_html=True,
+                )
+
+                for index, region in enumerate(
+                    regions,
+                    1,
+                ):
+
+                    st.write(
+                        f"**Region {index}:** "
+                        f"x={region.get('x')} · "
+                        f"y={region.get('y')} · "
+                        f"width={region.get('width')} · "
+                        f"height={region.get('height')}"
+                    )
+
+            if result.get("method"):
+
+                st.caption(
+                    f"Detection method: {result['method']}"
+                )
+
         # ----------------------------------------------------
-        # Extra evidence / metadata
+        # OPTICAL + SAR
         # ----------------------------------------------------
-        if result.get("confidence_note"):
-            with st.expander("Reliability note"):
-                st.write(result.get("confidence_note"))
 
-        if result.get("validation"):
-            with st.expander("Input validation"):
-                st.json(result.get("validation"))
+        if result.get("tool") == "optical_sar":
 
-        if result.get("checkpoint_info"):
-            with st.expander("Model information"):
-                st.json(result.get("checkpoint_info"))
+            st.markdown(
+                '<div class="section-heading">Optical–SAR evidence</div>',
+                unsafe_allow_html=True,
+            )
 
-        render_trace(result.get("trace", []))
+            evidence_image = evidence.get(
+                "evidence_image"
+            )
 
-        with st.expander("Developer response"):
+            if evidence_image and Path(
+                evidence_image
+            ).exists():
+
+                st.image(
+                    evidence_image,
+                    caption="Optical + SAR analysis",
+                    use_container_width=True,
+                )
+
+        # ----------------------------------------------------
+        # VQA
+        # ----------------------------------------------------
+
+        if result.get("tool") == "vqa":
+
+            st.markdown(
+                '<div class="section-heading">Remote-sensing vision</div>',
+                unsafe_allow_html=True,
+            )
+
+            source = (
+                evidence.get("image")
+                or evidence.get("source_image")
+            )
+
+            if source and Path(source).exists():
+
+                st.image(
+                    source,
+                    caption="Source satellite observation",
+                    use_container_width=True,
+                )
+
+        # ----------------------------------------------------
+        # TRACE
+        # ----------------------------------------------------
+
+        trace = result.get(
+            "trace",
+            [],
+        )
+
+        if trace:
+
+            st.markdown(
+                '<div class="section-heading">Execution trace</div>',
+                unsafe_allow_html=True,
+            )
+
+            for index, item in enumerate(
+                trace,
+                1,
+            ):
+
+                if not isinstance(item, dict):
+                    continue
+
+                step = item.get(
+                    "step",
+                    f"Step {index}",
+                )
+
+                status = item.get(
+                    "status",
+                    "completed",
+                )
+
+                message = item.get(
+                    "message",
+                    "",
+                )
+
+                st.markdown(
+                    f'<div class="trace-row"><div class="trace-index">{index:02d}</div><div><div class="trace-step">{esc(step)} <span style="color:#6f9b83;font-size:8px;text-transform:uppercase;">{esc(status)}</span></div><div class="trace-message">{esc(message)}</div></div></div>',
+                    unsafe_allow_html=True,
+                )
+
+        if result.get(
+            "confidence_note"
+        ):
+
+            with st.expander(
+                "Reliability note"
+            ):
+
+                st.write(
+                    result["confidence_note"]
+                )
+
+        with st.expander(
+            "Developer response"
+        ):
+
             st.json(result)
 
 
 # ============================================================
-# HISTORY PAGE
+# HISTORY
 # ============================================================
 
 elif st.session_state.page == "History":
+
     st.markdown(
-        '<div class="section-heading">History</div><div class="section-subheading">Recent analyses from this browser session.</div>',
+        '<div class="page-kicker">Workspace memory</div>',
+        unsafe_allow_html=True,
+    )
+
+    st.markdown(
+        '<div class="page-title">Analysis <span>history</span>.</div>',
         unsafe_allow_html=True,
     )
 
     if not st.session_state.history:
-        st.info("No analyses yet.")
+
+        st.info(
+            "No analyses yet."
+        )
+
     else:
-        for index, item in enumerate(st.session_state.history, start=1):
+
+        for index, item in enumerate(
+            st.session_state.history,
+            1,
+        ):
+
             st.markdown(
-                f'<div class="card"><span class="rank-pill">Analysis {index}</span><div class="card-title">{esc(item.get("query", ""))}</div><div class="card-text">{esc(item.get("task", ""))} · {esc(item.get("tool", ""))}</div></div>',
+                f'<div class="feature-card" style="min-height:unset;margin-bottom:10px;"><div class="feature-title">Observation {index}</div><div class="feature-text">{esc(item["query"])}</div><div class="feature-text">{esc(item["task"])} · {esc(item["tool"])}</div></div>',
                 unsafe_allow_html=True,
             )
-            with st.expander("View result"):
-                st.write(item.get("answer", ""))
+
+            with st.expander(
+                "View result"
+            ):
+
+                st.write(
+                    item["answer"]
+                )
 
 
 # ============================================================
-# SETTINGS PAGE
+# SETTINGS
 # ============================================================
 
 elif st.session_state.page == "Settings":
+
     st.markdown(
-        '<div class="section-heading">Settings</div><div class="section-subheading">Local prototype configuration.</div>',
+        '<div class="page-kicker">Configuration</div>',
         unsafe_allow_html=True,
     )
+
     st.markdown(
-        '<div class="card"><div class="card-icon">⚙</div><div class="card-title">SatQuery Core</div><div class="card-text">'
-        f'Backend: {esc(API_URL)}<br>Interface: Streamlit<br>Agent orchestration: enabled'
-        '</div></div>',
+        '<div class="page-title">SatQuery <span>settings</span>.</div>',
         unsafe_allow_html=True,
     )
+
+    for title, value in [
+        ("Backend", API_URL),
+        ("Interface", "Streamlit"),
+        ("Agent orchestration", "Enabled"),
+        ("Input formats", "PNG · JPG · JPEG · WEBP · BMP · TIFF · GeoTIFF · JP2"),
+        ("Analysis workflows", "Retrieval · Grounding · VQA · Change · Optical–SAR"),
+    ]:
+
+        st.markdown(
+            f'<div class="feature-card" style="min-height:unset;margin-bottom:10px;"><div class="feature-title">{esc(title)}</div><div class="feature-text">{esc(value)}</div></div>',
+            unsafe_allow_html=True,
+        )
 
 
 # ============================================================
-# HELP PAGE
+# HELP
 # ============================================================
 
 elif st.session_state.page == "Help":
+
     st.markdown(
-        '<div class="section-heading">Help</div><div class="section-subheading">How to use SatQuery.</div>',
+        '<div class="page-kicker">Guide</div>',
         unsafe_allow_html=True,
     )
-    help_items = [
-        ("Upload imagery", "Provide one image, a temporal pair, or an Optical + SAR pair depending on the workflow."),
-        ("Ask naturally", "Describe what you need rather than naming the model you think should be used."),
-        ("Analyze", "SatQuery validates inputs, chooses a workflow and executes the selected specialist."),
-        ("Inspect evidence", "Review visual outputs, confidence, validation and the execution trace."),
-    ]
-    for title, description in help_items:
+
+    st.markdown(
+        '<div class="page-title">Explore with <span>SatQuery</span>.</div>',
+        unsafe_allow_html=True,
+    )
+
+    for index, (
+        title,
+        description,
+    ) in enumerate(
+        [
+            (
+                "Upload imagery",
+                "Provide one image, a temporal pair, or an Optical + SAR pair.",
+            ),
+            (
+                "Ask naturally",
+                "Describe the information you need in ordinary language.",
+            ),
+            (
+                "Let the planner route it",
+                "SatQuery selects the corresponding specialist workflow.",
+            ),
+            (
+                "Inspect evidence",
+                "Review maps, detections, change regions, confidence and execution trace.",
+            ),
+        ],
+        1,
+    ):
+
         st.markdown(
-            f'<div class="card"><div class="card-title">{esc(title)}</div><div class="card-text">{esc(description)}</div></div>',
+            f'<div class="feature-card" style="min-height:unset;margin-bottom:11px;"><div class="feature-icon">{index:02d}</div><div class="feature-title">{esc(title)}</div><div class="feature-text">{esc(description)}</div></div>',
             unsafe_allow_html=True,
         )
 
@@ -916,6 +1667,6 @@ elif st.session_state.page == "Help":
 # ============================================================
 
 st.markdown(
-    '<div class="footer"><strong>SatQuery</strong> · Explore the Earth. Find answers.</div>',
+    '<div class="footer"><strong>SatQuery</strong> · Natural-language intelligence for remote-sensing imagery</div>',
     unsafe_allow_html=True,
 )
